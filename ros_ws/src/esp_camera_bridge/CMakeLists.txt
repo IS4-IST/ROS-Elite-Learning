@@ -13,8 +13,8 @@ find_package(std_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(OpenCV REQUIRED)
 
-add_executable(esp_camera_node src/esp_camera_node.cpp)
-target_include_directories(esp_camera_node PRIVATE ${OpenCV_INCLUDE_DIRS})
+add_executable(esp_camera_node src/esp_camera_node.cpp src/esp_udp_client.cpp)
+target_include_directories(esp_camera_node PRIVATE include ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(esp_camera_node ${OpenCV_LIBS})
 ament_target_dependencies(esp_camera_node rclcpp sensor_msgs std_msgs cv_bridge)
 

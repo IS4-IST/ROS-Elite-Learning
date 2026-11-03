@@ -1,99 +1,84 @@
-#include <atomic>
-#include <chrono>
 #include <memory>
 #include <string>
-#include <thread>
-#include <utility>
 #include <vector>
 
 #include <cv_bridge/cv_bridge.h>
-#include <opencv2/videoio.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/header.hpp>
 
-// One MJPEG stream from one ESP32-CAM, published on /<name>/image_raw
-class EspCamera
+#include "esp_camera_bridge/esp_udp_client.hpp"
+
+// Receives JPEG frames from one ESP32-CAM over UDP and publishes them on /<camera_name>/image_raw
+class EspCameraNode : public rclcpp::Node
 {
 public:
-  EspCamera(rclcpp::Node & node, std::string name, std::string url)
-  : logger_(node.get_logger()),
-    clock_(node.get_clock()),
-    name_(std::move(name)),
-    url_(std::move(url))
+  EspCameraNode()
+  : Node("esp_camera_bridge")
   {
-    publisher_ = node.create_publisher<sensor_msgs::msg::Image>("/" + name_ + "/image_raw", 10);
-    worker_ = std::thread(&EspCamera::loop, this);
+    camera_name_ = declare_parameter<std::string>("camera_name", "esp1");
+    esp_ip_ = declare_parameter<std::string>("esp_ip", "192.168.4.1");
+    command_port_ = static_cast<uint16_t>(declare_parameter<int>("command_port", 3333));
+    udp_port_ = static_cast<uint16_t>(declare_parameter<int>("udp_port", 3334));
+    mode_ = declare_parameter<std::string>("mode", "stream");
+
+    publisher_ = create_publisher<sensor_msgs::msg::Image>("/" + camera_name_ + "/image_raw", 10);
+
+    client_ = std::make_unique<esp_camera_bridge::EspUdpClient>(esp_ip_, command_port_, udp_port_);
+    client_->start([this](std::vector<uint8_t> && jpeg) { onFrame(std::move(jpeg)); });
+    client_->sendCommand(mode_);
+
+    RCLCPP_INFO(
+      get_logger(), "[%s] %s mode, commands to %s:%u, frames on UDP %u",
+      camera_name_.c_str(), mode_.c_str(), esp_ip_.c_str(), command_port_, udp_port_);
   }
 
-  ~EspCamera()
+  ~EspCameraNode() override
   {
-    running_ = false;
-    if (worker_.joinable()) {
-      worker_.join();
-    }
+    // Joins the receive thread before the publisher goes away
+    client_->stop();
   }
 
 private:
-  void loop()
+  void onFrame(std::vector<uint8_t> && jpeg)
   {
-    cv::VideoCapture cap(url_);
-    if (!cap.isOpened()) {
-      RCLCPP_ERROR(logger_, "[%s] cannot open stream %s", name_.c_str(), url_.c_str());
+    cv::Mat frame = cv::imdecode(jpeg, cv::IMREAD_COLOR);
+    if (frame.empty()) {
+      RCLCPP_WARN(get_logger(), "[%s] dropped a frame that is not a valid JPEG", camera_name_.c_str());
       return;
     }
-    RCLCPP_INFO(logger_, "[%s] streaming from %s", name_.c_str(), url_.c_str());
 
-    cv::Mat frame;
-    while (running_ && rclcpp::ok()) {
-      if (!cap.read(frame) || frame.empty()) {
-        RCLCPP_WARN(logger_, "[%s] failed to read frame", name_.c_str());
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        continue;
-      }
+    std_msgs::msg::Header header;
+    header.stamp = now();
+    header.frame_id = camera_name_;
 
-      std_msgs::msg::Header header;
-      header.stamp = clock_->now();
-      header.frame_id = name_;
-
-      publisher_->publish(*cv_bridge::CvImage(header, "bgr8", frame).toImageMsg());
-    }
+    publisher_->publish(*cv_bridge::CvImage(header, "bgr8", frame).toImageMsg());
   }
 
-  rclcpp::Logger logger_;
-  rclcpp::Clock::SharedPtr clock_;
-  std::string name_;
-  std::string url_;
+  std::string camera_name_;
+  std::string esp_ip_;
+  uint16_t command_port_{3333};
+  uint16_t udp_port_{3334};
+  std::string mode_;
+
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr publisher_;
-  std::thread worker_;
-  std::atomic<bool> running_{true};
+  std::unique_ptr<esp_camera_bridge::EspUdpClient> client_;
 };
 
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-  auto node = std::make_shared<rclcpp::Node>("esp_camera_bridge");
 
-  auto names = node->declare_parameter<std::vector<std::string>>(
-    "camera_names", std::vector<std::string>{"esp1", "esp2"});
-  auto urls = node->declare_parameter<std::vector<std::string>>(
-    "stream_urls",
-    std::vector<std::string>{"****/stream", "****/stream"});
-
-  if (names.size() != urls.size()) {
-    RCLCPP_FATAL(node->get_logger(), "camera_names and stream_urls must have the same length");
+  try {
+    auto node = std::make_shared<EspCameraNode>();
+    rclcpp::spin(node);
+  } catch (const std::exception & e) {
+    RCLCPP_FATAL(rclcpp::get_logger("esp_camera_bridge"), "%s", e.what());
     rclcpp::shutdown();
     return 1;
   }
 
-  // Declared after node so they are destroyed before it
-  std::vector<std::unique_ptr<EspCamera>> cameras;
-  for (size_t i = 0; i < names.size(); ++i) {
-    cameras.push_back(std::make_unique<EspCamera>(*node, names[i], urls[i]));
-  }
-
-  rclcpp::spin(node);
-  cameras.clear();
   rclcpp::shutdown();
   return 0;
 }
