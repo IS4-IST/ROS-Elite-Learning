@@ -56,7 +56,9 @@ int main(int argc, char** argv)
     cv::Mat image;                       // last decoded frame (kept on screen until a newer one arrives)
     std::vector<uint8_t> current_jpeg;   // its JPEG bytes, for saving
     bool redraw = false;                 // only redraw when there is something new to show
-    cv::namedWindow("ESP32-CAM", cv::WINDOW_AUTOSIZE);
+    //cv::namedWindow("ESP32-CAM", cv::WINDOW_AUTOSIZE);
+    cv::namedWindow("ESP32-CAM", cv::WINDOW_NORMAL | cv::WINDOW_KEEPRATIO);
+    cv::resizeWindow("ESP32-CAM", 1920, 1080);
 
     while (!quit) {
         // fps over 2-second windows, plus a status line
