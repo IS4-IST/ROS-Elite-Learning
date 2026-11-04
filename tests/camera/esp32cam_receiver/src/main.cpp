@@ -106,7 +106,10 @@ int main(int argc, char** argv)
                 reinterpret_cast<const char*>(current_jpeg.data()), std::streamsize(current_jpeg.size()));
             std::fprintf(stderr, "saved %s\n", name.c_str());
         }
-        if (cv::getWindowProperty("ESP32-CAM", cv::WND_PROP_VISIBLE) < 1) quit = true;   // window closed
+        static bool was_visible = false;
+        const double visible = cv::getWindowProperty("ESP32-CAM", cv::WND_PROP_VISIBLE);
+        if(visible >= 1) was_visible = true;
+        else if (was_visible) quit = true;
     }
 
     receiver.stop();
