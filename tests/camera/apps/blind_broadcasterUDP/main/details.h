@@ -122,7 +122,7 @@ camera_config_t* get_config(){
     camera_config.pin_pclk = CAM_PIN_PCLK;
 
     //XCLK 20MHz or 10MHz for OV2640 double FPS (Experimental)
-    camera_config.xclk_freq_hz = 10000000; //16
+    camera_config.xclk_freq_hz = 16000000; // OV5640: set_pll in app_main assumes 16 MHz (~45 MHz SYSCLK)
     camera_config.ledc_timer = LEDC_TIMER_0;
     camera_config.ledc_channel = LEDC_CHANNEL_0;
 
@@ -131,7 +131,7 @@ camera_config_t* get_config(){
     camera_config.pixel_format = PIXFORMAT_JPEG; //YUV422,GRAYSCALE,RGB565,JPEG
     camera_config.frame_size = FRAMESIZE_HD;    //QQVGA-UXGA, For ESP32, do not use sizes above QVGA when not JPEG. The performance of the ESP32-S series has improved a lot, but JPEG mode always gives better frame rates.
 
-    camera_config.jpeg_quality = 7; //0-63, for OV series camera sensors, lower number means higher quality
+    camera_config.jpeg_quality = 10; //0-63, for OV series camera sensors, lower number means higher quality
     camera_config.fb_count = 3;       //When jpeg mode is used, if fb_count more than one, the driver will work in continuous mode.
     camera_config.fb_location = CAMERA_FB_IN_PSRAM;
     camera_config.grab_mode = CAMERA_GRAB_LATEST;
