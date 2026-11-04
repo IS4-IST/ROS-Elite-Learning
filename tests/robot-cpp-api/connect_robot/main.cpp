@@ -4,7 +4,7 @@
 #include <Elite/DashboardClient.hpp>  
 
 using namespace ELITE;  
-
+//printf '{"jsonrpc":"2.0","method":"getSoftVersion","params":{},"id":1}\n' | nc -q 1 192.168.0.11 8055
 int main(int argc, char* argv[]) {  
     if (argc < 2) {  
         std::cout << "Must provide robot IP. Example: ./dashboard_example aaa.bbb.ccc.ddd" << std::endl;  
