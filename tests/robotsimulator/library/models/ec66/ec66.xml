@@ -1,0 +1,69 @@
+<!-- Elite EC66 arm, converted from the elite-robots2 URDF (MIT, neobotix gmbh).
+     Joint angles in radians. Visual geoms are group 1 (no collision); collision geoms use the same meshes. -->
+<mujoco model="ec66">
+  <compiler angle="radian" meshdir="meshes"/>
+
+  <asset>
+    <material name="ec_white" rgba="0.92 0.92 0.92 1" specular="0.3" shininess="0.5"/>
+    <mesh name="base_link" content_type="model/stl" file="base_link.stl"/>
+    <mesh name="link1" content_type="model/stl" file="link1.stl"/>
+    <mesh name="link2" content_type="model/stl" file="link2.stl"/>
+    <mesh name="link3" content_type="model/stl" file="link3.stl"/>
+    <mesh name="link4" content_type="model/stl" file="link4.stl"/>
+    <mesh name="link5" content_type="model/stl" file="link5.stl"/>
+    <mesh name="link6" content_type="model/stl" file="link6.stl"/>
+  </asset>
+
+  <worldbody>
+    <body name="base_link">
+      <inertial pos="0.00039768 8.0247e-10 0.012605" quat="0.500432 0.500179 -0.499821 0.499568" mass="0.41542" diaginertia="0.0010336 0.000546319 0.00053741"/>
+      <geom quat="1 0 0 0" type="mesh" contype="0" conaffinity="0" group="1" material="ec_white" density="0" mesh="base_link"/>
+      <geom quat="1 0 0 0" type="mesh" group="3" mesh="base_link"/>
+      <body name="link1" pos="0 0 0.096" quat="-3.67321e-06 0 0 1">
+        <inertial pos="3.9336e-06 -0.0082614 0.0028405" quat="0.601006 0.372447 -0.37264 0.601012" mass="1.7827" diaginertia="0.00369698 0.0031691 0.00274502"/>
+        <joint name="joint1" range="-6.2832 6.2832" actuatorfrcrange="-150 150" damping="1.5" frictionloss="3.5" armature="0.1"/>
+        <geom type="mesh" contype="0" conaffinity="0" group="1" material="ec_white" density="0" mesh="link1"/>
+        <geom type="mesh" group="3" mesh="link1"/>
+        <body name="link2" quat="0.499998 0.5 -0.5 0.500002">
+          <inertial pos="-2.17e-06 0.17637 0.13932" quat="0.496592 0.503239 -0.503391 0.496734" mass="4.8843" diaginertia="0.0225288 0.022101 0.00660768"/>
+          <joint name="joint2" range="-3.14 0" actuatorfrcrange="-150 150" damping="1.5" frictionloss="3.5" armature="0.1"/>
+          <geom pos="-7.19978e-21 -4.996e-16 -3.88578e-16" quat="1 0 0 0" type="mesh" contype="0" conaffinity="0" group="1" material="ec_white" density="0" mesh="link2"/>
+          <geom pos="-7.19978e-21 -4.996e-16 -3.88578e-16" quat="1 0 0 0" type="mesh" group="3" mesh="link2"/>
+          <body name="link3" pos="0 0.418 0" quat="0.707105 0 0 0.707108">
+            <inertial pos="0.20069 -7.9845e-06 0.028008" quat="-0.036442 0.70957 -0.0367942 0.702729" mass="2.1495" diaginertia="0.00915803 0.00915658 0.00157399"/>
+            <joint name="joint3" range="-2.7925 2.7925" actuatorfrcrange="-150 150" damping="1.5" frictionloss="3.5" armature="0.1"/>
+            <geom pos="-1.38778e-15 5.0822e-20 -1.59595e-16" quat="1 0 0 0" type="mesh" contype="0" conaffinity="0" group="1" material="ec_white" density="0" mesh="link3"/>
+            <geom pos="-1.38778e-15 5.0822e-20 -1.59595e-16" quat="1 0 0 0" type="mesh" group="3" mesh="link3"/>
+            <body name="link4" pos="0.398 0 0.122">
+              <inertial pos="-5.2274e-07 -0.00070291 -0.006006" quat="0.681884 -0.187097 0.18714 0.681915" mass="0.53436" diaginertia="0.000474891 0.00041486 0.000342099"/>
+              <joint name="joint4" range="-6.2832 6.2832" actuatorfrcrange="-28 28" damping="1.5" frictionloss="3.5" armature="0.1"/>
+              <geom quat="1 0 0 0" type="mesh" contype="0" conaffinity="0" group="1" material="ec_white" density="0" mesh="link4"/>
+              <geom quat="1 0 0 0" type="mesh" group="3" mesh="link4"/>
+              <body name="link5" pos="0 0.098 0" quat="-2.59734e-06 -2.59735e-06 -0.707108 -0.707105">
+                <inertial pos="5.2283e-07 0.00070291 -0.006006" quat="0.681884 0.187097 -0.187139 0.681915" mass="0.53436" diaginertia="0.000474891 0.00041486 0.000342099"/>
+                <joint name="joint5" range="-6.2832 6.2832" actuatorfrcrange="-28 28" damping="1.5" frictionloss="3.5" armature="0.1"/>
+                <geom quat="1 0 0 0" type="mesh" contype="0" conaffinity="0" group="1" material="ec_white" density="0" mesh="link5"/>
+                <geom quat="1 0 0 0" type="mesh" group="3" mesh="link5"/>
+                <body name="link6" pos="0 -0.089 0" quat="-2.59734e-06 2.59735e-06 -0.707108 0.707105">
+                  <inertial pos="-1.7556e-08 -0.00045052 -0.021169" quat="0.49979 0.500212 -0.500769 0.499227" mass="0.16488" diaginertia="0.00011744 7.7869e-05 7.75698e-05"/>
+                  <joint name="joint6" range="-6.2832 6.2832" actuatorfrcrange="-28 28" damping="1.5" frictionloss="3.5" armature="0.1"/>
+                  <geom quat="1 0 0 0" type="mesh" contype="0" conaffinity="0" group="1" material="ec_white" density="0" mesh="link6"/>
+                  <geom quat="1 0 0 0" type="mesh" group="3" mesh="link6"/>
+                  <body name="flange">
+                    <site name="tcp" size="0.005" rgba="1 0 0 1"/>
+                    <camera name="wrist_cam" pos="0 0.06 0.02" mode="fixed" euler="3.1416 0 0" fovy="70"/>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <contact>
+    <!-- base_link is welded to the world, so MuJoCo's parent-child filter doesn't apply to it -->
+    <exclude body1="base_link" body2="link1"/>
+  </contact>
+</mujoco>
