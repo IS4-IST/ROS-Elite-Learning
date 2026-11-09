@@ -11,6 +11,8 @@
 //  - The active tool (TCP + payload) is selected per tool number; call set_tool().
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <string>
@@ -71,9 +73,13 @@ public:
 
     // --- timestamped trajectory (2.2.9) ----------------------------------------
     // times in s from 0, strictly increasing, >= 3 points. Moves to points[0] first.
+    // `cancel` (optional) is checked between uploaded points and right before the start:
+    // set it from another thread (e.g. a STOP button) and the upload is abandoned with an
+    // ECError instead of the trajectory starting after the stop.
     void run_joint_trajectory(const std::vector<double>& times, const std::vector<Joints>& points,
                               double speed_percent = 100.0, double approach_speed = 10.0, bool wait = true,
-                              std::chrono::seconds timeout = std::chrono::seconds(120));
+                              std::chrono::seconds timeout = std::chrono::seconds(120),
+                              const std::atomic<bool>* cancel = nullptr);
     void stop_trajectory();
 
     // --- kinematics (2.2.4), computed by the controller ------------------------

@@ -1,25 +1,24 @@
-// Digital twin of the EC66: the MuJoCo model mirrors what the robot reports.
+// Digital twin of the EC66: the MuJoCo model mirrors what the robot reports, and the twin
+// is the ONLY program that commands the robot.
 //
-//   ./digitaltwin [model.xml] [--ip 192.168.0.11] [--max-change 30]
+//   ./digitaltwin [model.xml] [--ip 192.168.0.11] [--max-change 30] [--margin 10] [--no-ros]
 //
 //   --max-change DEG   largest joint change one "move joint" may command (default 30)
+//   --margin MM        clearance kept by planning and checked on every motion (default 10)
+//   --no-ros           don't start the ROS interface even if it was built
 //
-// Mirroring only needs the monitor port (8056), which serves several clients, so the
-// twin can run next to the bridge or any script. Every monitor packet's joint angles
-// are copied into the model (kinematics only, no physics): what you see is what the
-// controller says the arm is doing.
+// Mirroring uses only the monitor port (8056), which serves several clients, so the twin
+// can run next to anything. Every packet's joint angles go into the model (kinematics
+// only, no physics): what you see is what the controller says the arm is doing.
 //
-// The "Commands" panel can also drive the robot through ec_robot, over port 8055.
-// The controller accepts only ONE 8055 client, so connecting here locks out the bridge
-// and your scripts until you disconnect. Commands go through two locks:
-//   1. connect to 8055                  (button)
-//   2. arm commands                     (checkbox; drops by itself when the robot leaves
-//                                        remote mode, the monitor goes stale or 8055 closes)
-// STOP (button or space bar) works whenever 8055 is connected, armed or not.
-// The green ghost shows the joint target before you send it. A move whose largest
-// joint change exceeds --max-change is refused: one slip of a slider can mean 300 deg.
+// Commands go through twin::Core (twin_core.h), from two front ends:
+//   - this GUI (the operator): connect 8055, "arm commands", then power, moves, plans
+//   - ROS (when built with it, ros_interface.h): /follow_joint_trajectory, /stop, /power,
+//     /clear_alarm. Only after the operator ticks "accept external commands"; while an
+//     external motion runs, the operator's motion controls are locked.
+// STOP (button or space bar) works for everyone, always, while 8055 is connected.
 //
-// Point it at the simulator with --ip 127.0.0.1 to try the panel without the arm.
+// Point it at the simulator with --ip 127.0.0.1 to try everything without the arm.
 
 #include <GLFW/glfw3.h>
 #include <imgui.h>
@@ -27,93 +26,33 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <thread>
 
 #include "common.h"
 #include "viewer.h"
-#include "ec_robot/monitor.hpp"
-#include "ec_robot/robot.hpp"
+#include "twin_core.h"
+#ifdef EC_HAVE_ROS
+#include "ros_env.h"
+#include "ros_interface.h"
+#endif
 
 using namespace std::chrono_literals;
 using Clock = std::chrono::steady_clock;
+using twin::Source;
 
 namespace {
 
 constexpr double kDeg = mjPI / 180.0;
 
-// Runs blocking client calls (connect, power on, ...) off the rendering thread.
-// One job at a time; the result goes to message().
-class Worker {
-public:
-    Worker() : thread_([this] { io_.run(); }) {}
-    ~Worker() {
-        guard_.reset();
-        io_.stop();
-        thread_.join();
-    }
-
-    bool busy() const { return busy_; }
-
-    bool run(std::string what, std::function<void()> fn) {
-        if (busy_.exchange(true)) return false;
-        asio::post(io_, [this, what = std::move(what), fn = std::move(fn)] {
-            try {
-                fn();
-                report(what + ": ok", false);
-            } catch (const std::exception& e) {
-                report(what + ": " + e.what(), true);
-            }
-            busy_ = false;
-        });
-        return true;
-    }
-
-    std::pair<std::string, bool> message() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return {message_, error_};
-    }
-
-private:
-    void report(std::string text, bool error) {
-        std::printf("%s\n", text.c_str());
-        std::lock_guard<std::mutex> lock(mutex_);
-        message_ = std::move(text);
-        error_ = error;
-    }
-
-    asio::io_context io_;
-    asio::executor_work_guard<asio::io_context::executor_type> guard_{io_.get_executor()};
-    std::atomic<bool> busy_{false};
-    mutable std::mutex mutex_;
-    std::string message_;
-    bool error_ = false;
-    std::thread thread_;   // last: starts after everything above exists
-};
-
-// The connections, swapped by the worker and read by the rendering loop
-struct Link {
-    std::mutex mutex;
-    std::shared_ptr<ec::Monitor> monitor;   // 8056, for mirroring
-    std::shared_ptr<ec::Robot> robot;       // 8055 + its own 8056, for commands
-
-    std::shared_ptr<ec::Monitor> get_monitor() { std::lock_guard<std::mutex> l(mutex); return monitor; }
-    std::shared_ptr<ec::Robot> get_robot() { std::lock_guard<std::mutex> l(mutex); return robot; }
-    void set_monitor(std::shared_ptr<ec::Monitor> m) { std::lock_guard<std::mutex> l(mutex); monitor = std::move(m); }
-    void set_robot(std::shared_ptr<ec::Robot> r) { std::lock_guard<std::mutex> l(mutex); robot = std::move(r); }
-};
-
 struct Ui {
-    bool armed = false;
     bool show_ghost = true;
     bool target_set = false;
     ec::Joints target{};          // deg
@@ -121,6 +60,11 @@ struct Ui {
     double speed_override = 20;   // setSpeed, %
     int tool = 1;
     double max_change = 30;       // deg, per "move joint"
+    double plan_speed = 30;       // deg/s, every joint (motion limits)
+    double plan_acc = 60;         // deg/s^2
+    bool plan_preview = true;
+    std::string refusal;          // why the last motion button was refused
+    std::string ros_text = "ROS: not built in";
     // packet rate
     std::uint64_t packets = 0;
     Clock::time_point rate_t = Clock::now();
@@ -136,6 +80,7 @@ ImVec4 state_colour(ec::State s) {
     }
 }
 const ImVec4 kRed{1.0f, 0.35f, 0.3f, 1};
+const ImVec4 kGrey{0.6f, 0.6f, 0.6f, 1};
 
 double max_abs_diff(const ec::Joints& a, const ec::Joints& b) {
     double m = 0;
@@ -143,18 +88,26 @@ double max_abs_diff(const ec::Joints& a, const ec::Joints& b) {
     return m;
 }
 
+void show_result(const twin::Core& core) {
+    const twin::Outcome o = core.last_result();
+    if (o.message.empty()) return;
+    ImGui::Separator();
+    if (!o.ok) ImGui::TextColored(kRed, "%s", o.message.c_str());
+    else ImGui::TextWrapped("%s", o.message.c_str());
+}
+
 // --- panels -------------------------------------------------------------------------
-void observed_panel(const std::string& ip, const std::optional<ec::RobotStatus>& s, bool fresh, Ui& ui,
-                    const ec::Monitor* monitor, Worker& jobs, const std::function<void()>& reconnect,
+void observed_panel(twin::Core& core, const std::optional<ec::RobotStatus>& s, bool fresh, Ui& ui,
                     const mjModel* m, const mjData* d, int tcp_site) {
+    auto monitor = core.monitor();
     ImGui::SetNextWindowPos({10, 10}, ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize({470, 0}, ImGuiCond_Always);
     ImGui::Begin("Robot (observed)", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
 
-    ImGui::Text("%s:8056", ip.c_str());
+    ImGui::Text("%s:8056", core.ip().c_str());
     ImGui::SameLine();
     if (!s) {
-        ImGui::TextColored(kRed, jobs.busy() ? "connecting..." : "no data");
+        ImGui::TextColored(kRed, core.busy() ? "connecting..." : "no data");
     } else if (!fresh) {
         ImGui::TextColored(kRed, "STALE (%.1f s old)", s->age_seconds());
     } else {
@@ -164,9 +117,9 @@ void observed_panel(const std::string& ip, const std::optional<ec::RobotStatus>&
         ImGui::SameLine();
         ImGui::TextColored(kRed, "%llu invalid", static_cast<unsigned long long>(monitor->invalid_packets()));
     }
-    if ((!s || !fresh) && !jobs.busy()) {
+    if ((!s || !fresh) && !core.busy()) {
         ImGui::SameLine();
-        if (ImGui::SmallButton("reconnect")) reconnect();
+        if (ImGui::SmallButton("reconnect")) core.connect_monitor();
     }
     if (!s) {
         ImGui::End();
@@ -224,45 +177,27 @@ void observed_panel(const std::string& ip, const std::optional<ec::RobotStatus>&
     ImGui::End();
 }
 
-void show_message(const Worker& w) {
-    auto [text, error] = w.message();
-    if (text.empty()) return;
-    ImGui::Separator();
-    if (error) ImGui::TextColored(kRed, "%s", text.c_str());
-    else ImGui::TextWrapped("%s", text.c_str());
-}
 
-void commands_panel(const std::string& ip, const std::optional<ec::RobotStatus>& s, bool fresh, Ui& ui, Link& link,
-                    Worker& jobs, Worker& urgent, const mjModel* m) {
+void commands_panel(twin::Core& core, const std::optional<ec::RobotStatus>& s, bool /*fresh*/, Ui& ui, const mjModel* m) {
     ImGui::SetNextWindowPos({10, 300}, ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize({470, 0}, ImGuiCond_Always);
     ImGui::Begin("Commands", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
 
-    auto robot = link.get_robot();
-    const bool remote = s && s->robot_mode == ec::Mode::Remote;
-    if (ui.armed && (!robot || !fresh || !remote)) ui.armed = false;   // drop the arm switch by itself
+    auto robot = core.robot();
+    const bool external_running = core.active() == Source::External;
 
     // 1. connection --------------------------------------------------------------
-    ImGui::BeginDisabled(jobs.busy());
+    ImGui::BeginDisabled(core.busy() || core.active() != Source::None);
     if (!robot) {
-        if (ImGui::Button("connect 8055")) {
-            jobs.run("connect " + ip + ":8055", [&link, ip] {
-                auto r = std::make_shared<ec::Robot>(ip);
-                r->connect();
-                link.set_robot(std::move(r));
-            });
-        }
+        if (ImGui::Button("connect 8055")) core.connect_robot();
         ImGui::SameLine();
-        ImGui::TextWrapped("The controller takes one 8055 client: close the bridge and scripts first.");
-    } else {
-        if (ImGui::Button("disconnect 8055")) {
-            ui.armed = false;
-            jobs.run("disconnect 8055", [&link] { link.set_robot(nullptr); });
-        }
+        ImGui::TextWrapped("The controller takes one 8055 client: close other programs that use it first.");
+    } else if (ImGui::Button("disconnect 8055")) {
+        core.disconnect_robot();
     }
     ImGui::EndDisabled();
     if (!robot) {
-        show_message(jobs);
+        show_result(core);
         ImGui::End();
         return;
     }
@@ -271,49 +206,57 @@ void commands_panel(const std::string& ip, const std::optional<ec::RobotStatus>&
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.1f, 0.1f, 1));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.95f, 0.15f, 0.15f, 1));
     const bool stop_key = ImGui::IsKeyPressed(ImGuiKey_Space, false) && !ImGui::GetIO().WantTextInput;
-    if (ImGui::Button("STOP  (space)", {-1, 40}) || stop_key)
-        urgent.run("stop", [robot] { robot->stop(); });
+    if (ImGui::Button("STOP  (space)", {-1, 40}) || stop_key) core.stop("the operator");
     ImGui::PopStyleColor(2);
 
-    // 2. arm ----------------------------------------------------------------------
-    ImGui::BeginDisabled(!fresh || !remote);
-    ImGui::Checkbox("arm commands", &ui.armed);
+    // 2. permissions ----------------------------------------------------------------
+    bool armed = core.armed();
+    ImGui::BeginDisabled(!armed && !core.can_arm());
+    if (ImGui::Checkbox("arm commands", &armed)) core.set_armed(armed);
     ImGui::EndDisabled();
-    if (!remote) {
+    if (s && s->robot_mode != ec::Mode::Remote) {
         ImGui::SameLine();
         ImGui::TextColored(kRed, "robot not in remote mode");
     }
+    bool external = core.external_allowed();
+    ImGui::BeginDisabled(!core.armed());
+    if (ImGui::Checkbox("accept external commands", &external)) core.set_external_allowed(external);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Lets ROS clients (e.g. the planner) run motions, power on/off and clear alarms.\n"
+                          "Unticking it during an external motion stops that motion.");
+    ImGui::SameLine();
+    ImGui::TextColored(kGrey, "%s", ui.ros_text.c_str());
 
-    ImGui::BeginDisabled(!ui.armed || jobs.busy());
+    if (external_running) {
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.9f, 0.55f, 0.1f, 1));
+        ImGui::ProgressBar(static_cast<float>(core.progress()), {-1, 0}, "external motion running");
+        ImGui::PopStyleColor();
+        ImGui::TextWrapped("%s", core.motion_text().c_str());
+        ImGui::TextColored(kGrey, "Your motion controls are locked. STOP, or untick \"accept external\", aborts it.");
+    }
+
+    // 3. operator commands ------------------------------------------------------------
+    const bool locked = !core.armed() || core.busy() || core.active() != Source::None;
+    ImGui::BeginDisabled(locked);
     ImGui::SetNextItemWidth(80);
     ImGui::InputInt("tool", &ui.tool);
     ui.tool = std::clamp(ui.tool, 0, 7);
     ImGui::SameLine();
-    if (ImGui::Button("power on")) {
-        const int tool = ui.tool;
-        const double speed = ui.speed_override;
-        jobs.run("power on", [robot, tool, speed] {
-            robot->set_tool(tool);
-            robot->power_on();
-            robot->set_speed(speed);
-        });
-    }
+    if (ImGui::Button("power on")) core.power(true, Source::Operator);
     ImGui::SameLine();
-    if (ImGui::Button("power off")) jobs.run("power off", [robot] { robot->power_off(); });
+    if (ImGui::Button("power off")) core.power(false, Source::Operator);
     ImGui::SameLine();
-    if (ImGui::Button("clear alarm")) jobs.run("clear alarm", [robot] { robot->rpc().call("clearAlarm"); });
+    if (ImGui::Button("clear alarm")) core.clear_alarm(Source::Operator);
 
     ImGui::SetNextItemWidth(200);
     const double one = 1, hundred = 100;
     ImGui::SliderScalar("##override", ImGuiDataType_Double, &ui.speed_override, &one, &hundred, "%.0f %%");
     ImGui::SameLine();
-    if (ImGui::Button("set speed override")) {
-        const double v = ui.speed_override;
-        jobs.run("set speed", [robot, v] { robot->set_speed(v); });
-    }
+    if (ImGui::Button("set speed override")) core.set_speed(ui.speed_override);
     ImGui::EndDisabled();
 
-    // joint target (editable while disarmed, so you can line up the ghost first)
+    // joint target (editable while locked, so you can line up the ghost first)
     ImGui::SeparatorText("joint target");
     for (int i = 0; i < 6; ++i) {
         double lo = -360, hi = 360;
@@ -337,69 +280,140 @@ void commands_panel(const std::string& ip, const std::optional<ec::RobotStatus>&
     const bool too_far = change > ui.max_change;
     ImGui::Text("largest joint change:");
     ImGui::SameLine();
-    if (too_far) ImGui::TextColored(kRed, "%.1f deg  (limit %.0f: move refused)", change, ui.max_change);
+    if (too_far) ImGui::TextColored(kRed, "%.1f deg  (limit %.0f: plan it instead)", change, ui.max_change);
     else ImGui::Text("%.1f deg  (limit %.0f)", change, ui.max_change);
 
-    ImGui::BeginDisabled(!ui.armed || jobs.busy());
+    ImGui::BeginDisabled(locked);
     ImGui::SetNextItemWidth(150);
     const double lo_v = 1, hi_v = 100;
     ImGui::SliderScalar("speed##move", ImGuiDataType_Double, &ui.move_speed, &lo_v, &hi_v, "%.0f");
     ImGui::SameLine();
     ImGui::BeginDisabled(too_far);
-    const bool move = ImGui::Button("move joint");
+    if (ImGui::Button("move joint") && !too_far) core.move_joint(ui.target, ui.move_speed);
     ImGui::EndDisabled();
-    if (move && !too_far) {
-        const ec::Joints q = ui.target;
-        const double v = ui.move_speed;
-        jobs.run("moveByJoint", [robot, q, v] { robot->move_joint(q, v, false); });
-    }
     ImGui::EndDisabled();
 
-    // last results
-    show_message(jobs);
-    if (urgent.message().second) show_message(urgent);   // only a failed stop is worth showing
+    show_result(core);
     ImGui::End();
+}
+
+void motion_panel(twin::Core& core, const std::optional<ec::RobotStatus>& s, bool fresh, Ui& ui) {
+    ImGui::SetNextWindowPos({500, 10}, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize({420, 0}, ImGuiCond_Always);
+    ImGui::Begin("Motion", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+
+    // limits: time the operator's plans and external paths, and cap external timed trajectories
+    ImGui::TextColored(kGrey, "motion limits (every joint)");
+    ImGui::SetNextItemWidth(120);
+    const double v_lo = 1, v_hi = 120, a_lo = 1, a_hi = 240;
+    ImGui::SliderScalar("deg/s", ImGuiDataType_Double, &ui.plan_speed, &v_lo, &v_hi, "%.0f");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120);
+    ImGui::SliderScalar("deg/s^2", ImGuiDataType_Double, &ui.plan_acc, &a_lo, &a_hi, "%.0f");
+
+    ImGui::BeginDisabled(!fresh || core.busy() || core.active() != Source::None);
+    if (ImGui::Button("plan to target")) core.plan_to(ui.target);
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::TextDisabled("(target = the joint sliders)");
+
+    const auto plan = core.plan();
+    ImGui::Separator();
+    if (!plan) {
+        ImGui::TextDisabled("no plan");
+        ImGui::End();
+        return;
+    }
+    ImGui::TextWrapped("%s", plan->source.c_str());
+    ImGui::Text("%s", plan->summary.c_str());
+    ImGui::Checkbox("preview (blue ghost)", &ui.plan_preview);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("discard")) core.discard_plan();
+
+    const double off = s ? max_abs_diff(s->q(), plan->traj.points.front()) : 1e9;
+    const char* why_not = !core.robot() ? "connect 8055 in Commands"
+                        : !core.armed() ? "arm commands in Commands"
+                        : core.active() == Source::External ? "an external motion is running"
+                        : off > 0.5 ? "the arm is not at the plan's start: plan again"
+                        : core.busy() ? "busy"
+                        : nullptr;
+    ImGui::BeginDisabled(why_not != nullptr);
+    if (ImGui::Button("execute plan", {-1, 30}) && !why_not) {
+        ui.refusal.clear();
+        if (!core.run_plan(plan, Source::Operator, {}, &ui.refusal)) ui.refusal = "refused: " + ui.refusal;
+    }
+    ImGui::EndDisabled();
+    if (why_not) ImGui::TextColored(off > 0.5 && s ? kRed : kGrey, "%s", why_not);
+    if (!ui.refusal.empty()) ImGui::TextColored(kRed, "%s", ui.refusal.c_str());
+    ImGui::End();
+}
+
+// Where the preview ghost is: the plan replayed in real time, with a 1 s pause at the end
+const ec::Joints& preview_pose(const twin::Plan& plan) {
+    const double cycle = plan.traj.duration() + 1.0;
+    const double t = std::min(std::fmod(std::chrono::duration<double>(Clock::now() - plan.created).count(), cycle),
+                              plan.traj.duration());
+    auto it = std::upper_bound(plan.traj.times.begin(), plan.traj.times.end(), t);
+    const std::size_t i = it == plan.traj.times.begin() ? 0 : static_cast<std::size_t>(it - plan.traj.times.begin()) - 1;
+    return plan.traj.points[i];
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
+#ifdef EC_HAVE_ROS
+    ec::ensure_ros_environment(argv);   // first: may restart the program once
+#endif
     std::string path = ec::default_model_path();
     std::string ip = "192.168.0.11";
-    double max_change = 30;
+    double max_change = 30, margin_mm = 10;
+    bool no_ros = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--ip" && i + 1 < argc) ip = argv[++i];
         else if (a == "--max-change" && i + 1 < argc) max_change = std::stod(argv[++i]);
+        else if (a == "--margin" && i + 1 < argc) margin_mm = std::stod(argv[++i]);
+        else if (a == "--no-ros") no_ros = true;
+        else if (a == "--ros-args") break;   // the rest belongs to ROS
         else if (a[0] != '-') path = a;
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 1; }
     }
 
     try {
         ec::ModelPtr model = ec::load_model(path);
-        ec::DataPtr data(mj_makeData(model.get()));    // the observed robot
-        ec::DataPtr ghost(mj_makeData(model.get()));   // the command target
+        ec::DataPtr data(mj_makeData(model.get()));         // the observed robot
+        ec::DataPtr ghost(mj_makeData(model.get()));        // the joint target
+        ec::DataPtr plan_ghost(mj_makeData(model.get()));   // the plan preview
         ec::reset_home(model.get(), data.get());
         mj_forward(model.get(), data.get());
         const int tcp_site = mj_name2id(model.get(), mjOBJ_SITE, "tcp");
 
-        Link link;
-        Worker jobs, urgent;
+        ec::planning::Options plan_options;
+        plan_options.margin = margin_mm / 1000.0;
+        twin::Core core(model.get(), ip, plan_options);
         Ui ui;
         ui.max_change = max_change;
-        auto connect_monitor = [&] {
-            jobs.run("monitor " + ip + ":8056", [&link, ip] {
-                link.set_monitor(nullptr);
-                auto mon = std::make_shared<ec::Monitor>(ip);
-                mon->start(2000ms);
-                link.set_monitor(std::move(mon));
-            });
-        };
-        connect_monitor();
+
+#ifdef EC_HAVE_ROS
+        std::unique_ptr<twin::RosInterface> ros;   // after core: destroyed before it
+        if (no_ros) {
+            ui.ros_text = "ROS: off (--no-ros)";
+        } else {
+            ros = std::make_unique<twin::RosInterface>(core, argc, argv);
+            ui.ros_text = "ROS: on";
+        }
+#else
+        (void)no_ros;
+#endif
 
         ec::Viewer viewer(model.get(), ("EC66 digital twin - " + ip).c_str());
 
         asio::io_context context;
+        // Ctrl+C / SIGTERM: close the window like the close button (a running motion is stopped below)
+        asio::signal_set signals(context, SIGINT, SIGTERM);
+        signals.async_wait([&](const asio::error_code& ec, int) {
+            if (!ec) viewer.close();
+        });
         asio::high_resolution_timer rendering_timer{context};
         const GLFWvidmode* mode = glfwGetVideoMode(glfwGetPrimaryMonitor());
         const auto rendering_period = std::chrono::duration_cast<asio::high_resolution_timer::clock_type::duration>(
@@ -407,19 +421,19 @@ int main(int argc, char** argv) {
 
         std::function<void()> rendering;
         rendering = [&]() {
+            core.update_permissions();
+            core.set_limits(ui.plan_speed, ui.plan_acc);
+            core.set_power_settings(ui.tool, ui.speed_override);
+
             // mirror the latest monitor packet
-            auto monitor = link.get_monitor();
-            std::optional<ec::RobotStatus> status;
-            if (monitor) {
-                try { status = monitor->latest(0ms); } catch (const std::exception&) {}
-            }
-            const bool fresh = status && status->age_seconds() < 0.2;
+            const std::optional<ec::RobotStatus> status = core.status();
+            const bool fresh = twin::Core::fresh(status);
             if (status) {
                 for (int i = 0; i < 6; ++i) data->qpos[model->jnt_qposadr[i]] = status->joint_pos[i] * kDeg;
                 mj_forward(model.get(), data.get());
                 if (!ui.target_set) { ui.target = status->q(); ui.target_set = true; }
             }
-            if (monitor) {
+            if (auto monitor = core.monitor()) {
                 const auto now = Clock::now();
                 const double dt = std::chrono::duration<double>(now - ui.rate_t).count();
                 if (dt >= 1.0) {
@@ -430,15 +444,23 @@ int main(int argc, char** argv) {
             }
 
             viewer.begin_frame();
-            observed_panel(ip, status, fresh, ui, monitor.get(), jobs, connect_monitor, model.get(), data.get(),
-                           tcp_site);
-            commands_panel(ip, status, fresh, ui, link, jobs, urgent, model.get());
+            observed_panel(core, status, fresh, ui, model.get(), data.get(), tcp_site);
+            commands_panel(core, status, fresh, ui, model.get());
+            motion_panel(core, status, fresh, ui);
 
             viewer.update_scene(data.get());
-            if (ui.show_ghost && link.get_robot() && status && max_abs_diff(ui.target, status->q()) > 0.05) {
+            if (ui.show_ghost && core.robot() && status && max_abs_diff(ui.target, status->q()) > 0.05) {
                 for (int i = 0; i < 6; ++i) ghost->qpos[model->jnt_qposadr[i]] = ui.target[i] * kDeg;
                 mj_forward(model.get(), ghost.get());
                 viewer.add_ghost(ghost.get());
+            }
+            // the plan, replayed in blue (hidden while the arm is moving: then watch the arm)
+            if (auto plan = core.plan(); plan && ui.plan_preview && status &&
+                                         status->robot_state != ec::State::Running) {
+                const ec::Joints& q = preview_pose(*plan);
+                for (int i = 0; i < 6; ++i) plan_ghost->qpos[model->jnt_qposadr[i]] = q[i] * kDeg;
+                mj_forward(model.get(), plan_ghost.get());
+                viewer.add_ghost(plan_ghost.get(), {0.3f, 0.6f, 1.0f, 0.35f});
             }
             viewer.end_frame();
 
@@ -456,8 +478,7 @@ int main(int argc, char** argv) {
         while (!viewer.should_close()) {
             context.run_one();
         }
-        link.set_robot(nullptr);
-        link.set_monitor(nullptr);
+        if (core.active() != Source::None) core.stop("the twin closing").wait_for(1s);
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());

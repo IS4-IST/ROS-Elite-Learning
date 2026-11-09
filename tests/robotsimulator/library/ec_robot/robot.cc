@@ -162,13 +162,15 @@ Joints Robot::move_line(const Pose& pose, double speed, bool wait, std::optional
 
 void Robot::run_joint_trajectory(const std::vector<double>& times, const std::vector<Joints>& points,
                                  double speed_percent, double approach_speed, bool wait,
-                                 std::chrono::seconds timeout) {
+                                 std::chrono::seconds timeout, const std::atomic<bool>* cancel) {
+    auto cancelled = [cancel] { return cancel && cancel->load(); };
     if (times.size() != points.size() || points.size() < 3)
         throw std::invalid_argument("need >= 3 points and one timestamp per point");
     if (times.front() != 0.0) throw std::invalid_argument("timestamps must start at 0");
     for (std::size_t i = 1; i < times.size(); ++i) {
         if (times[i] <= times[i - 1]) throw std::invalid_argument("timestamps must increase");
     }
+    if (cancelled()) throw ECError("trajectory cancelled");
     move_joint(points.front(), approach_speed);
     rpc_.call("flush_trajectory");
     rpc_.call("start_push_pos", {{"path_lenth", points.size()},   // 'lenth' as in the manual
@@ -177,6 +179,11 @@ void Robot::run_joint_trajectory(const std::vector<double>& times, const std::ve
                                  {"ref_frame", Pose{}},
                                  {"ret_flag", 1}});
     for (std::size_t i = 0; i < points.size(); ++i) {
+        if (cancelled()) {
+            rpc_.call("stop_push_pos");
+            rpc_.call("flush_trajectory");
+            throw ECError("trajectory cancelled during upload");
+        }
         rpc_.call("push_pos", {{"timestamp", times[i]}, {"pos", points[i]}});
     }
     if (rpc_.call("stop_push_pos") == false) throw ECError("stop_push_pos: not all points were accepted");
@@ -185,6 +192,10 @@ void Robot::run_joint_trajectory(const std::vector<double>& times, const std::ve
         const char* reason = check == -1 ? "point count mismatch" : check == -2 ? "point format error"
                            : check == -3 ? "timestamps invalid" : "unknown";
         throw ECError(std::string("trajectory rejected: ") + reason);
+    }
+    if (cancelled()) {
+        rpc_.call("flush_trajectory");
+        throw ECError("trajectory cancelled before start");
     }
     if (rpc_.call("start_trajectory", {{"speed_percent", speed_percent}}) == false)
         throw ECError("start_trajectory rejected");

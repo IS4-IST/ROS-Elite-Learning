@@ -66,3 +66,35 @@ add_library(ec_emulator STATIC
 target_include_directories(ec_emulator PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ec_emulator PUBLIC mujoco::mujoco asio::asio nlohmann_json::nlohmann_json Threads::Threads)
 target_compile_options(ec_emulator PRIVATE -Wall -Wextra)
+
+# ---------------------------------------------------------------------------
+# ec_planning: OMPL joint-space planner with MuJoCo as the collision checker.
+#   The twin uses it to check every motion before it is sent, so it is required.
+#   OMPL 1.5 (Ubuntu 22.04/24.04 apt) only sets OMPL_* variables; OMPL >= 1.7
+#   exports ompl::ompl. Both are handled.
+# ---------------------------------------------------------------------------
+find_package(ompl REQUIRED)   # sudo apt install libompl-dev
+if(NOT TARGET ompl::ompl)
+    # OMPL 1.5's include list names folders that may not exist (OpenMPI, HDF5): keep the real ones
+    set(_ompl_includes "")
+    foreach(_dir IN LISTS OMPL_INCLUDE_DIRS)
+        if(EXISTS "${_dir}")
+            list(APPEND _ompl_includes "${_dir}")
+        endif()
+    endforeach()
+    # ...and its library list adds Boost dev symlinks Ubuntu's libompl-dev doesn't install;
+    # libompl.so already links Boost itself, so only existing files are kept
+    set(_ompl_libs "")
+    foreach(_lib IN LISTS OMPL_LIBRARIES)
+        if(EXISTS "${_lib}")
+            list(APPEND _ompl_libs "${_lib}")
+        endif()
+    endforeach()
+    add_library(ompl::ompl INTERFACE IMPORTED)
+    target_include_directories(ompl::ompl INTERFACE ${_ompl_includes})
+    target_link_libraries(ompl::ompl INTERFACE ${_ompl_libs})
+endif()
+add_library(ec_planning STATIC planning/planner.cc)
+target_include_directories(ec_planning PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ec_planning PUBLIC mujoco::mujoco ompl::ompl)
+target_compile_options(ec_planning PRIVATE -Wall -Wextra)
