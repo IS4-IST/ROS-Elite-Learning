@@ -243,18 +243,22 @@ int main(int argc, char** argv) {
         control_timer.expires_after(0ms);
         asio::post(control_context, control);
 
-        if (headless) {
-            if (!camera_requests.empty())
-                std::fprintf(stderr, "note: --camera ignored with --headless (cameras render with the window's OpenGL)\n");
+        if (headless && camera_requests.empty()) {   // nothing to render: no window at all
             asio::signal_set signals(control_context, SIGINT, SIGTERM);
             signals.async_wait([&](const asio::error_code&, int) { control_context.stop(); });
             control_context.run();
             return 0;
         }
-        // --- rendering: pendant + scene at the display rate ---------------------------
-        ec::Viewer viewer(model.get(), "EC66 simulator");   // may throw: before the thread starts
+
+        ec::Viewer viewer(model.get(), "EC66 simulator", headless ? 64 : 1400, headless ? 64 : 900,
+                          /*visible=*/!headless);   // may throw: before the thread starts
         std::thread control_thread([&] { control_context.run(); });
         asio::io_context context;
+        asio::signal_set signals(context, SIGINT, SIGTERM);   // Ctrl+C: close like the window's button
+        signals.async_wait([&](const asio::error_code& ec, int) {
+            if (!ec) viewer.close();
+        });
+
         // --- cameras: offscreen image -> H.264 -> TCP, on this thread (it owns the GL context)
         camera::EncoderConfig cam_cfg;
         cam_cfg.width = cam_width;
@@ -364,9 +368,11 @@ int main(int argc, char** argv) {
                 if (!ec) rendering();
             });
         };
-        rendering_timer.expires_after(0ms);
-        asio::post(context, rendering);
 
+        if (!headless) {   // hidden window: cameras only, no pendant or scene
+            rendering_timer.expires_after(0ms);
+            asio::post(context, rendering);
+        }
 
         while (!viewer.should_close()) {
             context.run_one();

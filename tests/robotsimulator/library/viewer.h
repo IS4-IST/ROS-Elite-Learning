@@ -24,7 +24,7 @@ namespace ec {
 
 class Viewer {
 public:
-    Viewer(const mjModel* m, const char* title, int width = 1400, int height = 900);
+    Viewer(const mjModel* m, const char* title, int width = 1400, int height = 900, bool visible = true);
     ~Viewer();
     Viewer(const Viewer&) = delete;
     Viewer& operator=(const Viewer&) = delete;

@@ -10,9 +10,10 @@
 
 namespace ec {
 
-Viewer::Viewer(const mjModel* m, const char* title, int width, int height) : m_(m) {
+Viewer::Viewer(const mjModel* m, const char* title, int width, int height,bool visible) : m_(m) {
     if (!glfwInit()) throw std::runtime_error("glfwInit failed (is there a display?)");
     glfwWindowHint(GLFW_SAMPLES, 4);
+    glfwWindowHint(GLFW_VISIBLE, visible ? GLFW_TRUE : GLFW_FALSE);
     window_ = glfwCreateWindow(width, height, title, nullptr, nullptr);
     if (!window_) throw std::runtime_error("could not open a window");
     glfwMakeContextCurrent(window_);
