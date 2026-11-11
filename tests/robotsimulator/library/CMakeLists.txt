@@ -83,6 +83,23 @@ target_link_libraries(ec_emulator PUBLIC mujoco::mujoco asio::asio nlohmann_json
 target_compile_options(ec_emulator PRIVATE -Wall -Wextra)
 
 # ---------------------------------------------------------------------------
+# ec_camera: H.264 camera streams (see camera/stream_format.h for the wire format)
+#   encoder (FFmpeg libavcodec + libswscale) and a TCP server on your io_context.
+#   sudo apt install libavcodec-dev libswscale-dev libavutil-dev
+# ---------------------------------------------------------------------------
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavutil libswscale)
+add_library(ec_camera STATIC camera/errors.cc camera/stream_format.cc camera/encoder.cc camera/server.cc
+                             camera/decoder.cc camera/client.cc)
+target_include_directories(ec_camera PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ec_camera PUBLIC PkgConfig::FFMPEG asio::asio Threads::Threads)
+target_compile_options(ec_camera PRIVATE -Wall -Wextra)
+target_compile_options(ec_camera PUBLIC $<$<CXX_COMPILER_ID:GNU>:-Wno-mismatched-new-delete>)   # asio coroutines, as ec_robot
+
+add_executable(camera_probe camera/tools/camera_probe.cc)
+target_link_libraries(camera_probe PRIVATE ec_camera)
+
+# ---------------------------------------------------------------------------
 # ec_planning: OMPL joint-space planner with MuJoCo as the collision checker.
 #   The twin uses it to check every motion before it is sent, so it is required.
 #   OMPL 1.5 (Ubuntu 22.04/24.04 apt) only sets OMPL_* variables; OMPL >= 1.7

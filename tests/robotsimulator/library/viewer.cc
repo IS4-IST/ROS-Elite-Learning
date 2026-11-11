@@ -23,6 +23,10 @@ Viewer::Viewer(const mjModel* m, const char* title, int width, int height) : m_(
     mjv_defaultScene(&scn_);
     mjr_defaultContext(&con_);
     mjv_makeScene(m_, &scn_, 4000);   // room for the ghost copy as well
+    mjv_defaultScene(&capture_scn_);
+    mjv_makeScene(m_, &capture_scn_, 2000);
+    mjv_defaultCamera(&capture_cam_);
+    capture_cam_.type = mjCAMERA_FIXED;
     mjr_makeContext(m_, &con_, mjFONTSCALE_150);
     cam_.lookat[0] = 0.2; cam_.lookat[1] = 0.0; cam_.lookat[2] = 0.4;
     cam_.distance = 2.0; cam_.azimuth = 135; cam_.elevation = -20;
@@ -53,6 +57,7 @@ Viewer::~Viewer() {
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
     mjr_freeContext(&con_);
+    mjv_freeScene(&capture_scn_);
     mjv_freeScene(&scn_);
     glfwDestroyWindow(window_);
     glfwTerminate();
@@ -82,6 +87,21 @@ void Viewer::add_ghost(mjData* d, std::array<float, 4> rgba) {
         g.transparent = 1;
         g.reflectance = 0;
     }
+}
+
+void Viewer::update_capture(mjData* d, int camera_id) {
+    capture_cam_.fixedcamid = camera_id;
+    mjv_updateScene(m_, d, &opt_, nullptr, &capture_cam_, mjCAT_ALL, &capture_scn_);
+}
+
+bool Viewer::read_capture(int width, int height, unsigned char* rgb) {
+    if (width > con_.offWidth || height > con_.offHeight) return false;
+    const mjrRect viewport = {0, 0, width, height};
+    mjr_setBuffer(mjFB_OFFSCREEN, &con_);
+    mjr_render(viewport, &capture_scn_, &con_);
+    mjr_readPixels(rgb, nullptr, viewport, &con_);   // waits for the GPU (~1-3 ms at 640x480)
+    mjr_setBuffer(mjFB_WINDOW, &con_);
+    return true;
 }
 
 void Viewer::end_frame() {

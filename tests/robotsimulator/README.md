@@ -26,7 +26,8 @@ simulator or EC66  <-------------->  digitaltwin  <-------------------->  planne
 
 ```bash
 sudo apt install build-essential cmake git libglfw3-dev libasio-dev nlohmann-json3-dev \
-                 libegl-dev libgl-dev libompl-dev
+                 libegl-dev libgl-dev libompl-dev \
+                 libavcodec-dev libswscale-dev libavutil-dev pkg-config
 sudo apt install ros-humble-control-msgs     # only for the ROS interface; the rest is in ros-base
 cmake -S . -B build
 cmake --build build -j
@@ -85,6 +86,42 @@ argument, the planner as `--model`. For example, with `library/models/scene_pill
 
 Mouse: left drag rotates, right drag moves, shift for the horizontal variant, wheel zooms.
 Keys: `c` cycles cameras, `esc` (or Ctrl+C in the terminal) quits, `space` sends STOP in the twin.
+
+## Cameras (simulator)
+
+The simulator can play your cameras too: it renders a model camera offscreen, encodes it
+as H.264 and serves it on a TCP port, the way the ESP32-P4 nodes will.
+
+```bash
+./build/simulator/simulator library/models/scene_pillar.xml --camera scene_cam --camera wrist_cam:5001
+nc 127.0.0.1 5000 | ffplay -f h264 -fflags nobuffer -           # watch it
+./build/library/camera_probe 127.0.0.1 5000                    # fps, keyframes, kbit/s, latency
+```
+
+Options: `--camera NAME[:PORT]` (repeat; ports from 5000), `--camera-size 640x480`,
+`--camera-fps 30`, `--camera-gop 15`, `--camera-bitrate 2000`, `--camera-codec libx264`.
+Cameras need the window (they use its OpenGL context), so `--headless` has none. A camera
+with no client isn't rendered or encoded.
+
+The stream is plain H.264 Annex-B, nothing else on the wire, so any H.264 decoder plays
+it. Each frame carries an SEI unit with its frame id and capture time (Unix ns); the
+format is in `library/camera/stream_format.h`, and the P4 firmware should send the same.
+Baseline profile, no B-frames, SPS/PPS on every keyframe. A new client gets a keyframe at
+once; a client too slow for a frame skips to the next keyframe instead of queueing.
+
+### Watching the cameras in the twin
+
+```bash
+./build/digitaltwin/digitaltwin library/models/scene_pillar.xml --ip 127.0.0.1 \
+    --camera scene=127.0.0.1:5000 --camera wrist=127.0.0.1:5001
+```
+
+Each `--camera NAME=HOST:PORT` gets its own resizable panel: the live image (scaled to the
+panel keeping its aspect ratio; untick "fit" for 1:1), and the stream's fps, kbit/s, decode
+time, latency (arrival minus capture time, so clock offset included), frames skipped by the
+camera and decode errors. A lost stream greys the last image out and reconnects every second.
+The client decodes each frame as soon as its last byte arrives (the SEI says how many bytes
+follow it), on the GUI thread, straight into an OpenGL texture.
 
 ## Who may command the robot (digital twin)
 
@@ -244,6 +281,13 @@ library/
     streamer.*                   transparent transmission at 8 ms (tt_put), with safety aborts
     tests/                       test_rpc, test_monitor, test_robot, test_stream
   planning/                    OMPL + MuJoCo planner, timing, collision checks (target ec_planning)
+  camera/                      H.264 camera streams (target ec_camera, FFmpeg)
+    stream_format.*              the wire format: NAL splitting, timestamp SEI
+    encoder.*                    RGB -> H.264 with libavcodec (libx264 by default)
+    server.*                     TCP broadcast on your io_context, keyframe-aware
+    decoder.*                    H.264 -> RGBA with libavcodec, low delay
+    client.*                     async receiver: reconnects, cuts frames by the SEI, stats
+    tools/camera_probe.cc        connect and report fps, keyframes, bitrate, latency
   models/scene.xml             floor, lights, cameras, position servos, "home" keyframe
   models/scene_pillar.xml      scene.xml + an obstacle, for trying the planner
   models/ec66/                 the arm (converted from the elite-robots2 URDF, MIT meshes)
@@ -251,6 +295,7 @@ simulator/simulator.cc         fake robot: servers + 8 ms control timer + pendan
 digitaltwin/
   twin_core.*                  the one place that commands the robot: permissions, checks, motions
   digitaltwin.cc               GUI front end (mirror, commands, motion panels)
+  camera_view.*                a camera panel: client + OpenGL texture + numbers
   ros_interface.*              ROS 2 front end (only built with ROS)
 planner/planner.cc             plan; with ROS read /joint_states and send to the twin
 ```
@@ -258,7 +303,8 @@ planner/planner.cc             plan; with ROS read /joint_states and send to the
 Threads:
 
 - **Simulator.** One `io_context` on its own thread for the 8055/8056 servers and the 8 ms
-  control timer. The rendering timer runs on the main thread. Physics catches up to
+  control timer. The rendering timer runs on the main thread, and so do the cameras (their
+  own timer at the camera rate), because rendering needs the window's OpenGL context. Physics catches up to
   wall-clock time inside `Controller::tick`, so simulated time follows real time even when
   a frame takes long.
 - **Twin.** Three threads, no blocking calls anywhere:

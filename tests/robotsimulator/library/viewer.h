@@ -38,6 +38,16 @@ public:
     void add_ghost(mjData* d, std::array<float, 4> rgba = {0.2f, 0.9f, 0.3f, 0.35f});
     void end_frame();
 
+    // Offscreen images from the model's fixed cameras (the simulator's cameras), on the
+    // window's thread. Split in two so the caller holds its data lock only for the update:
+    //   { lock; viewer.update_capture(d, camera_id); }
+    //   viewer.read_capture(w, h, rgb);   // RGB24, rows bottom-up
+    // Images can't be larger than the model's <visual><global offwidth offheight>.
+    void update_capture(mjData* d, int camera_id);
+    bool read_capture(int width, int height, unsigned char* rgb);
+    int capture_max_width() const { return con_.offWidth; }
+    int capture_max_height() const { return con_.offHeight; }
+
     mjvOption& option() { return opt_; }
     mjvCamera& camera() { return cam_; }
     GLFWwindow* window() { return window_; }
@@ -55,6 +65,8 @@ private:
     mjvCamera cam_;
     mjvOption opt_;
     mjvScene scn_;
+    mjvScene capture_scn_;      // the camera images' own scene, so the window's is untouched
+    mjvCamera capture_cam_;
     mjrContext con_;
     int camera_index_ = -1;   // -1 = free camera, else fixed camera id
     bool button_left_ = false, button_right_ = false;

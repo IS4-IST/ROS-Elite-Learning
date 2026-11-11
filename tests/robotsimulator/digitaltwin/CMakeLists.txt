@@ -1,5 +1,6 @@
-add_executable(digitaltwin digitaltwin.cc twin_core.cc)
-target_link_libraries(digitaltwin PRIVATE ec_common ec_robot ec_planning asio::asio)
+find_package(OpenGL REQUIRED)   # camera textures (glTexImage2D)
+add_executable(digitaltwin digitaltwin.cc twin_core.cc camera_view.cc)
+target_link_libraries(digitaltwin PRIVATE ec_common ec_robot ec_planning ec_camera asio::asio OpenGL::GL)
 target_compile_options(digitaltwin PRIVATE -Wall -Wextra)
 
 # ROS front end, when ROS 2 was found (top-level CMakeLists.txt)

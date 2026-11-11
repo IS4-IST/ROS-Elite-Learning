@@ -6,6 +6,9 @@
 //   --max-change DEG   largest joint change one "move joint" may command (default 30)
 //   --margin MM        clearance kept by planning and checked on every motion (default 10)
 //   --no-ros           don't start the ROS interface even if it was built
+//   --camera NAME=HOST:PORT   show a camera's H.264 stream in its own panel (repeat for
+//                      more). The simulator serves its cameras from port 5000:
+//                      --camera scene=127.0.0.1:5000 --camera wrist=127.0.0.1:5001
 //
 // Mirroring uses only the monitor port (8056), which serves several clients, so the twin
 // can run next to anything. Every packet's joint angles go into the model (kinematics
@@ -35,7 +38,9 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
+#include "camera_view.h"
 #include "common.h"
 #include "viewer.h"
 #include "twin_core.h"
@@ -368,12 +373,21 @@ int main(int argc, char** argv) {
     std::string ip = "192.168.0.11";
     double max_change = 30, margin_mm = 10;
     bool no_ros = false;
+    std::vector<twin::CameraSource> camera_sources;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--ip" && i + 1 < argc) ip = argv[++i];
         else if (a == "--max-change" && i + 1 < argc) max_change = std::stod(argv[++i]);
         else if (a == "--margin" && i + 1 < argc) margin_mm = std::stod(argv[++i]);
         else if (a == "--no-ros") no_ros = true;
+        else if (a == "--camera" && i + 1 < argc) {
+            twin::CameraSource source;
+            if (!twin::parse_camera_source(argv[++i], static_cast<int>(camera_sources.size()), source)) {
+                std::fprintf(stderr, "--camera wants NAME=HOST:PORT or HOST:PORT, got %s\n", argv[i]);
+                return 1;
+            }
+            camera_sources.push_back(source);
+        }
         else if (a == "--ros-args") break;   // the rest belongs to ROS
         else if (a[0] != '-') path = a;
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 1; }
@@ -414,6 +428,12 @@ int main(int argc, char** argv) {
         signals.async_wait([&](const asio::error_code& ec, int) {
             if (!ec) viewer.close();
         });
+        // cameras: received and decoded on this thread, shown as textures (after context and
+        // viewer, so they're destroyed first)
+        std::vector<std::unique_ptr<twin::CameraView>> cameras;
+        for (std::size_t c = 0; c < camera_sources.size(); ++c)
+            cameras.push_back(std::make_unique<twin::CameraView>(context, camera_sources[c], static_cast<int>(c)));
+
         asio::high_resolution_timer rendering_timer{context};
         const GLFWvidmode* mode = glfwGetVideoMode(glfwGetPrimaryMonitor());
         const auto rendering_period = std::chrono::duration_cast<asio::high_resolution_timer::clock_type::duration>(
@@ -447,6 +467,7 @@ int main(int argc, char** argv) {
             observed_panel(core, view, fresh, ui, model.get(), data.get(), tcp_site);
             commands_panel(core, view, ui, model.get());
             motion_panel(core, view, fresh, ui);
+            for (auto& camera : cameras) camera->draw();
 
             viewer.update_scene(data.get());
             if (ui.show_ghost && view.rpc_connected && status && max_abs_diff(ui.target, status->q()) > 0.05) {

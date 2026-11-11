@@ -12,7 +12,8 @@ endif()
 
 # ---------------------------------------------------------------------------
 # System packages:
-#   sudo apt install build-essential cmake git libglfw3-dev libasio-dev nlohmann-json3-dev libegl-dev libgl-dev
+#   sudo apt install build-essential cmake git libglfw3-dev libasio-dev nlohmann-json3-dev libegl-dev libgl-dev \
+#                    libavcodec-dev libswscale-dev libavutil-dev pkg-config
 #   sudo apt install libompl-dev
 #   ROS 2 (optional): see the ROS section below
 # ---------------------------------------------------------------------------
