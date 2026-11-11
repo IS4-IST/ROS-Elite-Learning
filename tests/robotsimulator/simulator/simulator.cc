@@ -155,6 +155,7 @@ int main(int argc, char** argv) {
         std::printf("EC66 simulator on %s:8055/8056 (%s)\n%s\n", bind.c_str(), path.c_str(),
                     controller.describe().c_str());
 
+        // --- control: the controller's 8 ms cycle ------------------------------------
         asio::high_resolution_timer control_timer{control_context};
         const auto control_period = 8ms;
         const auto t0 = Clock::now();
@@ -188,7 +189,7 @@ int main(int argc, char** argv) {
             control_context.run();
             return 0;
         }
-
+        // --- rendering: pendant + scene at the display rate ---------------------------
         ec::Viewer viewer(model.get(), "EC66 simulator");   // may throw: before the thread starts
         std::thread control_thread([&] { control_context.run(); });
         asio::io_context context;

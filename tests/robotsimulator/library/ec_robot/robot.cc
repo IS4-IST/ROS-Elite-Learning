@@ -1,4 +1,4 @@
-#include "robot.hpp"
+#include "robot.h"
 
 #include <cmath>
 #include <sstream>
@@ -42,6 +42,7 @@ double max_abs_diff(const Joints& a, const Joints& b) {
     return m;
 }
 
+// a json array of 6 numbers -> Joints/Pose; false if it isn't one
 bool to_six(const nlohmann::json& v, std::array<double, 6>& out) {
     if (!v.is_array() || v.size() < 6) return false;
     for (int i = 0; i < 6; ++i) {
@@ -84,6 +85,24 @@ asio::awaitable<std::error_code> Robot::connect() {
     if (ec) {
         rpc_.close();
         co_return fail(ec, "8056: " + ec.message());
+    }
+    co_return std::error_code{};
+}
+
+asio::awaitable<std::error_code> Robot::connect_monitor() {
+    const std::error_code ec = co_await monitor_.connect();
+    co_return ec ? fail(ec, "8056: " + ec.message()) : std::error_code{};
+}
+
+asio::awaitable<std::error_code> Robot::connect_rpc() {
+    std::error_code ec = co_await rpc_.connect();
+    if (ec) co_return fail(ec, "8055: " + ec.message());
+    // A controller that already has a client accepts the connection and closes it at once:
+    // only an answer proves this connection is ours.
+    const Reply r = co_await rpc_.call("getSoftVersion");
+    if (r.ec) {
+        rpc_.close();
+        co_return fail(r.ec, "8055 closed the connection: another client holds it");
     }
     co_return std::error_code{};
 }
@@ -197,8 +216,11 @@ asio::awaitable<Result<ToolInfo>> Robot::tool_info(int tool_num) {
 
 asio::awaitable<std::error_code> Robot::stop() { co_return co_await command("stop"); }
 
+asio::awaitable<std::error_code> Robot::clear_alarm() { co_return co_await command("clearAlarm"); }
+
 asio::awaitable<std::error_code> Robot::stop_trajectory() { co_return co_await command("stop_trajectory"); }
 
+// --- motion -----------------------------------------------------------------------------------------
 asio::awaitable<std::error_code> Robot::wait_until_stopped(std::chrono::seconds timeout, std::optional<Joints> q_target,
                                                            double tol) {
     // Did the motion start at all? (A move to where the arm already is never leaves 'stop'.)
@@ -342,6 +364,7 @@ asio::awaitable<std::error_code> Robot::run_joint_trajectory(std::vector<double>
     co_return co_await wait_until_stopped(timeout, points.back());
 }
 
+// --- kinematics -------------------------------------------------------------------------------------
 asio::awaitable<Result<Pose>> Robot::forward_kinematics(Joints q) {
     nlohmann::json p = {{"targetPos", q}, {"unit_type", 1}};
     const Reply r = co_await rpc_.call("positiveKinematic", p);

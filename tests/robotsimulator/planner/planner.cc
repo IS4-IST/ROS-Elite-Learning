@@ -135,11 +135,18 @@ int execute(const rclcpp::Node::SharedPtr& node, rclcpp::Executor& executor, con
     auto result_future = client->async_get_result(handle);
 
     bool cancel_sent = false;
+    auto server_seen = std::chrono::steady_clock::now();
     while (executor.spin_until_future_complete(result_future, 50ms) == rclcpp::FutureReturnCode::TIMEOUT) {
         if (interrupted && !cancel_sent) {
             std::printf("\ncancelling (the twin stops the arm)\n");
             client->async_cancel_goal(handle);
             cancel_sent = true;
+        }
+        // the twin went away mid-goal (closed or crashed): no result will ever come
+        if (client->action_server_is_ready()) server_seen = std::chrono::steady_clock::now();
+        else if (std::chrono::steady_clock::now() - server_seen > 2s) {
+            std::printf("FAILED   the twin's action server disappeared during the motion\n");
+            return 4;
         }
     }
     const auto wrapped = result_future.get();

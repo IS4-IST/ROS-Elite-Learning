@@ -212,7 +212,13 @@ before trusting either on the real arm.
 | operator unticks the grant mid-motion | aborted "stopped: the operator withdrew external control", arm stopped |
 | operator STOP mid-motion | aborted "stopped by the operator", arm stopped |
 | operator "plan to target" + execute | done |
+| goal to where the arm already is | done: "already at the goal, nothing to do" |
+| twin closed (SIGINT) mid-motion | twin stops the arm and exits; planner: "FAILED the twin's action server disappeared" (exit 4) |
 | `/power`, `/stop` without 8055 | `success=false` with the reason |
+
+Library tests (no ROS needed; start `build/simulator/simulator` first):
+`build/library/test_rpc`, `test_monitor`, `test_robot`, `test_stream`. Turn them off with
+`-DEC_BUILD_TESTS=OFF`.
 
 ## Layout
 
@@ -229,7 +235,14 @@ library/
     kinematics.*                 FK / IK on the MuJoCo model (positiveKinematic / inverseKinematic)
     packet.*                     8056 monitor packet encoder
     servers.*                    8055 and 8056 TCP servers
-  ec_robot/                    the C++ robot client, same code as ec_robot_cpp (target ec_robot)
+  ec_robot/                    async robot client, C++20 coroutines (target ec_robot)
+    types.*                      Joints, Pose, Mode, State, Result<T>
+    net.h                        connect with a timeout
+    rpc_client.*                 8055 JSON-RPC: one reader, one writer queue, replies matched by id
+    monitor.*                    8056 stream: latest status, wait_until(predicate, timeout)
+    robot.*                      commands, moves, trajectory upload; errors as std::error_code
+    streamer.*                   transparent transmission at 8 ms (tt_put), with safety aborts
+    tests/                       test_rpc, test_monitor, test_robot, test_stream
   planning/                    OMPL + MuJoCo planner, timing, collision checks (target ec_planning)
   models/scene.xml             floor, lights, cameras, position servos, "home" keyframe
   models/scene_pillar.xml      scene.xml + an obstacle, for trying the planner
@@ -248,11 +261,31 @@ Threads:
   control timer. The rendering timer runs on the main thread. Physics catches up to
   wall-clock time inside `Controller::tick`, so simulated time follows real time even when
   a frame takes long.
-- **Twin.** The rendering timer runs on the main thread, in the `while (!should_close)
-  context.run_one();` loop. Two workers (`jobs`: connect, power, plans, motions; `urgent`:
-  stop only) keep the window drawing during blocking calls. With ROS, a 4-thread
-  executor runs in separate callback groups, so a slow `/power` never delays `/stop`, the
-  joint states or the action.
+- **Twin.** Three threads, no blocking calls anywhere:
+  - *main*: rendering timer and GUI, in the `while (!should_close) context.run_one();` loop.
+    It reads a `View` snapshot of the core each frame.
+  - *robot*: one `io_context` owns `ec::Robot` (RPC, monitor, motions) as coroutines. A
+    STOP is just another coroutine on it and is answered while a trajectory uploads.
+  - *planning*: OMPL, timing and collision checks. Motions hop there with
+    `co_await co_spawn(planning_context, ..., use_awaitable)` and come back to the robot
+    thread when done.
+
+  With ROS, a 4-thread executor runs in separate callback groups, so a slow `/power` never
+  delays `/stop`, the joint states or the action. Every core call takes a callback; nothing
+  returns a future to wait on.
+
+## The robot library (`ec_robot`) in short
+
+- Everything is `asio::awaitable` on the caller's `io_context`. No locks except the
+  monitor's latest-status copy, no threads of its own.
+- Expected failures are `std::error_code` (categories `ec-controller`, `ec-monitor`,
+  `ec-robot`, `ec-stream`), with `last_error_detail()` for the human-readable reason.
+  Nothing throws for a refused command, a timeout or a lost connection.
+- Builds with the Asio in Ubuntu 22.04 (1.18.1): no awaitable operators, no `as_tuple`;
+  timeouts are timers that close the socket or cancel a wait.
+- GCC 11–13 coroutine pitfalls avoided in this code: no braced init list inside a
+  `co_await` expression (internal compiler error), no structured bindings on a
+  `co_await` result, and `-Wno-mismatched-new-delete` for a false positive.
 
 `ec_egl` is a separate target on purpose. MuJoCo picks its OpenGL loader from the
 libraries already loaded in the process, so one program must link **either** EGL +

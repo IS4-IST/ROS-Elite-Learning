@@ -24,7 +24,7 @@ inline void ensure_ros_environment(char** argv) {
     const std::string dir = EC_ROS_DIR;
     setenv("AMENT_PREFIX_PATH", dir.c_str(), 1);
     const char* old = std::getenv("LD_LIBRARY_PATH");
-    //const std::string ld = dir + "/lib" + (old && *old ? std::string(":") + old : std::string());
+    // the same folders Humble's setup.bash adds (the arch folder holds some vendored libraries)
     const std::string ld = dir + "/lib/x86_64-linux-gnu:" + dir + "/lib" +
                            (old && *old ? std::string(":") + old : std::string());
     setenv("LD_LIBRARY_PATH", ld.c_str(), 1);

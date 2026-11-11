@@ -1,15 +1,16 @@
-#include "monitor.hpp"
- 
+#include "monitor.h"
+#include "net.h"
+
 #include <cstring>
- 
+
 namespace ec {
 namespace {
- 
+
 // Big-endian reader over a packet, bounded so it never reads the matching word
 class Reader {
 public:
     Reader(const std::vector<std::uint8_t>& p, std::size_t limit) : p_(p), limit_(limit) {}
- 
+
     template <typename T>
     bool get(T& out) {
         if (pos_ + sizeof(T) > limit_) return false;
@@ -24,7 +25,7 @@ public:
         }
         return true;
     }
- 
+
     template <typename T, std::size_t N>
     bool get(std::array<T, N>& out) {
         for (auto& v : out) {
@@ -32,59 +33,31 @@ public:
         }
         return true;
     }
- 
+
 private:
     const std::vector<std::uint8_t>& p_;
     std::size_t limit_;
     std::size_t pos_ = 0;
 };
- 
+
 }  // namespace
 
-// Connect `socket` to ip:port, giving up after `timeout`. No exceptions: refused, unreachable,
-// timed_out (the timer won) or invalid_argument (not an IP address) come back as the error code.
-inline asio::awaitable<std::error_code> connect_with_timeout(asio::ip::tcp::socket& socket, const std::string& ip,
-                                                             unsigned short port, std::chrono::milliseconds timeout) {
-    std::error_code ec;
-    const asio::ip::tcp::endpoint endpoint(asio::ip::make_address(ip, ec), port);
-    if (ec) co_return ec;
- 
-    // If the timer fires first it closes the socket, which ends the connect with operation_aborted.
-    // (Asio 1.18 has no awaitable operators for racing two operations.)
-    asio::steady_timer timer(socket.get_executor());
-    timer.expires_after(timeout);
-    timer.async_wait([&socket](std::error_code e) {
-        if (!e) socket.close();
-    });
-    co_await socket.async_connect(endpoint, asio::redirect_error(asio::use_awaitable, ec));
-    const bool timed_out = timer.expiry() <= asio::steady_timer::clock_type::now();
-    timer.cancel();
-    if (ec) {
-        std::error_code ignored;
-        socket.close(ignored);
-        co_return (timed_out && ec == asio::error::operation_aborted) ? std::error_code(asio::error::timed_out) : ec;
-    }
-    socket.set_option(asio::ip::tcp::no_delay(true), ec);   // no Nagle delay on small messages
-    co_return ec;
-}
-
- 
 Joints RobotStatus::q() const {
     Joints q{};
     for (int i = 0; i < 6; ++i) q[i] = joint_pos[i];
     return q;
 }
- 
+
 Joints RobotStatus::qd() const {
     Joints v{};
     for (int i = 0; i < 6; ++i) v[i] = joint_speed[i];
     return v;
 }
- 
+
 double RobotStatus::age_seconds() const {
     return std::chrono::duration<double>(Clock::now() - received).count();
 }
- 
+
 RobotStatus decode_packet(const std::vector<std::uint8_t>& p) {
     RobotStatus s;
     s.received = Clock::now();
@@ -115,7 +88,7 @@ RobotStatus decode_packet(const std::vector<std::uint8_t>& p) {
     s.force_sensor_connected = sensor != 0;
     return s;
 }
- 
+
 // --- error category ---------------------------------------------------------------------
 namespace {
 class MonitorCategory : public std::error_category {
@@ -133,27 +106,27 @@ public:
     }
 };
 }  // namespace
- 
+
 std::error_code make_error_code(MonitorErrc e) {
     static MonitorCategory category;
     return {static_cast<int>(e), category};
 }
- 
+
 // --- Monitor ----------------------------------------------------------------------------------
 Monitor::Monitor(asio::io_context& context, std::string ip, std::uint16_t port, bool strict,
                  std::chrono::milliseconds timeout)
     : context_(context), ip_(std::move(ip)), port_(port), strict_(strict), timeout_(timeout), socket_(context) {}
- 
+
 Monitor::~Monitor() {
     std::error_code ignored;
     socket_.close(ignored);   // directly: we're on the context's thread, or it has stopped
 }
- 
+
 asio::awaitable<std::error_code> Monitor::connect() {
     if (std::error_code ec = co_await connect_with_timeout(socket_, ip_, port_, timeout_)) co_return ec;
     connected_ = true;
     asio::co_spawn(context_, reader(), asio::detached);   // one reader for the connection's life
- 
+
     // Connected is not enough: 8055 (or any other service) also accepts connections.
     // Only a valid packet proves this is the monitor stream.
     // (no structured bindings on co_await results: GCC 11-13 have coroutine bugs there)
@@ -164,7 +137,7 @@ asio::awaitable<std::error_code> Monitor::connect() {
     }
     co_return std::error_code{};
 }
- 
+
 void Monitor::close() {
     asio::post(context_, [this] {
         std::error_code ignored;
@@ -173,17 +146,17 @@ void Monitor::close() {
         connected_ = false;
     });
 }
- 
+
 std::optional<RobotStatus> Monitor::latest() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return latest_;
 }
- 
+
 std::error_code Monitor::last_error() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return error_;
 }
- 
+
 void Monitor::wake_all(std::error_code ec) {
     for (Waiter* w : waiters_) {
         w->done = true;
@@ -191,7 +164,7 @@ void Monitor::wake_all(std::error_code ec) {
         w->timer.cancel();
     }
 }
- 
+
 asio::awaitable<std::pair<std::error_code, RobotStatus>>
 Monitor::wait_until(std::function<bool(const RobotStatus&)> pred, std::chrono::milliseconds timeout) {
     if (!connected_) co_return std::pair{std::error_code(asio::error::not_connected), RobotStatus{}};
@@ -205,7 +178,7 @@ Monitor::wait_until(std::function<bool(const RobotStatus&)> pred, std::chrono::m
     if (!w.done) co_return std::pair{std::error_code(asio::error::timed_out), RobotStatus{}};
     co_return std::pair{w.ec, std::move(w.status)};
 }
- 
+
 asio::awaitable<void> Monitor::reader() {
     std::vector<std::uint8_t> packet;
     int consecutive_invalid = 0;
@@ -217,7 +190,7 @@ asio::awaitable<void> Monitor::reader() {
         }
         wake_all(asio::error::not_connected);
     };
- 
+
     for (;;) {
         // size field first (4 bytes, big-endian), then the rest of the packet
         std::array<std::uint8_t, 4> head{};
@@ -237,7 +210,7 @@ asio::awaitable<void> Monitor::reader() {
         co_await asio::async_read(socket_, asio::buffer(packet.data() + 4, size - 4),
                                   asio::redirect_error(asio::use_awaitable, ec));
         if (ec) { stop(ec); co_return; }
- 
+
         RobotStatus status = decode_packet(packet);
         ++packets_;
         if (strict_ && !status.valid) {
@@ -263,5 +236,5 @@ asio::awaitable<void> Monitor::reader() {
         }
     }
 }
- 
+
 }  // namespace ec

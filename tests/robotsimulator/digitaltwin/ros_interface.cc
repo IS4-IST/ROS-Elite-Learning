@@ -13,6 +13,8 @@
 #include <array>
 #include <cmath>
 #include <string>
+#include <future>
+#include <functional>
 #include <thread>
 
 using namespace std::chrono_literals;
@@ -29,6 +31,17 @@ using std_srvs::srv::SetBool;
 using std_srvs::srv::Trigger;
 
 constexpr double kDeg = M_PI / 180.0;
+
+// Start a core command and wait for its outcome (service callbacks run on executor threads,
+// never on the core's own threads, so waiting here can't block the core)
+Outcome wait_for_outcome(const std::function<void(Callback)>& start, std::chrono::seconds timeout, const char* what) {
+    auto promise = std::make_shared<std::promise<Outcome>>();
+    auto future = promise->get_future();
+    start([promise](const Outcome& o) { promise->set_value(o); });
+    if (future.wait_for(timeout) != std::future_status::ready)
+        return Outcome{false, std::string(what) + ": no answer in " + std::to_string(timeout.count()) + " s"};
+    return future.get();
+}
 const std::array<std::string, 6> kJointNames = {"joint1", "joint2", "joint3", "joint4", "joint5", "joint6"};
 
 double max_abs_diff(const ec::Joints& a, const ec::Joints& b) {
@@ -104,8 +117,7 @@ RosInterface::RosInterface(Core& core, int argc, char** argv) : impl_(std::make_
     d.stop_srv = d.node->create_service<Trigger>(
         "stop",
         [&d](const std::shared_ptr<Trigger::Request>, std::shared_ptr<Trigger::Response> res) {
-            auto f = d.core.stop("ROS /stop");
-            const Outcome o = f.wait_for(5s) == std::future_status::ready ? f.get() : Outcome{false, "stop: no answer in 5 s"};
+            const Outcome o = wait_for_outcome([&d](Callback cb) { d.core.stop("ROS /stop", std::move(cb)); }, 5s, "stop");
             res->success = o.ok;
             res->message = o.message;
         },
@@ -113,8 +125,9 @@ RosInterface::RosInterface(Core& core, int argc, char** argv) : impl_(std::make_
     d.power_srv = d.node->create_service<SetBool>(
         "power",
         [&d](const std::shared_ptr<SetBool::Request> req, std::shared_ptr<SetBool::Response> res) {
-            auto f = d.core.power(req->data, Source::External);
-            const Outcome o = f.wait_for(60s) == std::future_status::ready ? f.get() : Outcome{false, "power: no answer in 60 s"};
+            const bool on = req->data;
+            const Outcome o = wait_for_outcome([&d, on](Callback cb) { d.core.power(on, Source::External, std::move(cb)); },
+                                               60s, "power");
             res->success = o.ok;
             res->message = o.message;
         },
@@ -122,8 +135,8 @@ RosInterface::RosInterface(Core& core, int argc, char** argv) : impl_(std::make_
     d.clear_srv = d.node->create_service<Trigger>(
         "clear_alarm",
         [&d](const std::shared_ptr<Trigger::Request>, std::shared_ptr<Trigger::Response> res) {
-            auto f = d.core.clear_alarm(Source::External);
-            const Outcome o = f.wait_for(10s) == std::future_status::ready ? f.get() : Outcome{false, "clear alarm: no answer in 10 s"};
+            const Outcome o = wait_for_outcome([&d](Callback cb) { d.core.clear_alarm(Source::External, std::move(cb)); },
+                                               10s, "clear alarm");
             res->success = o.ok;
             res->message = o.message;
         },
@@ -141,7 +154,7 @@ RosInterface::RosInterface(Core& core, int argc, char** argv) : impl_(std::make_
                 std::lock_guard<std::mutex> lock(d.goal_mutex);
                 if (goal != d.active_goal) return rclcpp_action::CancelResponse::REJECT;
             }
-            d.core.cancel_motion("the ROS client (goal cancelled)");
+            d.core.cancel_motion("the ROS client cancelled the goal");
             return rclcpp_action::CancelResponse::ACCEPT;
         },
         [&d](const std::shared_ptr<GoalHandle> goal) { d.accept_goal(goal); },
@@ -158,7 +171,7 @@ RosInterface::~RosInterface() {
     Impl& d = *impl_;
     {
         std::lock_guard<std::mutex> lock(d.goal_mutex);
-        if (d.active_goal) d.core.cancel_motion("the twin closing");
+        if (d.active_goal) d.core.cancel_motion("the twin is closing");
     }
     d.executor->cancel();
     if (d.spin_thread.joinable()) d.spin_thread.join();
@@ -207,11 +220,12 @@ void RosInterface::Impl::publish_status() {
         msg.values.push_back(kv("estop", s->estop ? "pressed" : "no"));
         msg.values.push_back(kv("collision", s->collision ? "yes" : "no"));
     }
-    msg.values.push_back(kv("connected_8055", core.robot() ? "yes" : "no"));
-    msg.values.push_back(kv("armed", core.armed() ? "yes" : "no"));
-    msg.values.push_back(kv("external_control", core.external_allowed() ? "granted" : "not granted"));
-    msg.values.push_back(kv("active_motion", to_string(core.active())));
-    msg.values.push_back(kv("progress", std::to_string(core.progress())));
+    const View v = core.view();
+    msg.values.push_back(kv("connected_8055", v.rpc_connected ? "yes" : "no"));
+    msg.values.push_back(kv("armed", v.armed ? "yes" : "no"));
+    msg.values.push_back(kv("external_control", v.external ? "granted" : "not granted"));
+    msg.values.push_back(kv("active_motion", to_string(v.active)));
+    msg.values.push_back(kv("progress", std::to_string(v.progress)));
     status_pub->publish(msg);
 }
 
@@ -298,24 +312,16 @@ void RosInterface::Impl::accept_goal(const std::shared_ptr<GoalHandle>& goal) {
         fb->desired.time_from_start = rclcpp::Duration::from_seconds(t);
         goal->publish_feedback(fb);
     };
-    cb.done = [this, goal](const Outcome& o) { finish(goal, o, true); };
+    // refusals and results both arrive here; Outcome::started tells them apart
+    cb.done = [this, goal](const Outcome& o) { finish(goal, o, o.started); };
 
-    std::string why;
-    bool started;
     if (timed) {
         ec::planning::Trajectory t;
         t.times = std::move(times);
         t.points = std::move(points);
-        started = core.run_timed(std::move(t), Source::External, cb, &why);
+        core.run_timed(std::move(t), Source::External, std::move(cb));
     } else {
-        started = core.run_path(std::move(points), Source::External, cb, &why);
-    }
-    if (!started) {
-        {
-            std::lock_guard<std::mutex> lock(goal_mutex);
-            active_goal.reset();
-        }
-        refuse(why);
+        core.run_path(std::move(points), Source::External, std::move(cb));
     }
 }
 

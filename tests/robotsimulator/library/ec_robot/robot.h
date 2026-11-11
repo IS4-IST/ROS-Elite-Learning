@@ -24,9 +24,9 @@
 #include <string>
 #include <vector>
 
-#include "monitor.hpp"
-#include "rpc_client.hpp"
-#include "ec_robot/types.hpp"
+#include "monitor.h"
+#include "rpc_client.h"
+#include "types.hpp"
 
 namespace ec {
 
@@ -62,10 +62,13 @@ public:
 
     asio::awaitable<std::error_code> connect();   // 8055 + 8056
     void close();
+    // The ports separately: mirroring needs only 8056, and the controller takes just one 8055 client
+    asio::awaitable<std::error_code> connect_monitor();
+    asio::awaitable<std::error_code> connect_rpc();
+    void close_rpc() { rpc_.close(); }
+    asio::io_context& context() { return context_; }
     RpcClient& rpc() { return rpc_; }
     Monitor& monitor() { return monitor_; }
-    asio::io_context& context(){ return context_; };
-    
 
     // --- state (synchronous: they only read the latest monitor packet) ------------------
     std::optional<RobotStatus> status() const { return monitor_.latest(); }
@@ -83,6 +86,7 @@ public:
     asio::awaitable<std::error_code> set_tool(int tool_num);      // TCP + payload for remote mode
     asio::awaitable<Result<ToolInfo>> tool_info(int tool_num);
     asio::awaitable<std::error_code> stop();
+    asio::awaitable<std::error_code> clear_alarm();
     asio::awaitable<std::error_code> stop_trajectory();
 
     // --- point-to-point ----------------------------------------------------------------------

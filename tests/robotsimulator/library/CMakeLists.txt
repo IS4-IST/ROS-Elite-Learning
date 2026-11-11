@@ -40,18 +40,33 @@ if(OpenGL_EGL_FOUND)
 endif()
 
 # ---------------------------------------------------------------------------
-# ec_robot: C++ client for the controller (8055 JSON-RPC, 8056 monitor, streaming)
-#   Same code as ec_robot_cpp; headers are included as "ec_robot/robot.hpp".
+# ec_robot: async C++ client for the controller, on your io_context (C++20 coroutines)
+#   rpc_client (8055 JSON-RPC), monitor (8056 status), robot (operations), streamer
+#   (transparent transmission). Expected failures are std::error_code, not exceptions.
+#   Headers are included as "ec_robot/robot.h".
 # ---------------------------------------------------------------------------
 add_library(ec_robot STATIC
+    ec_robot/types.cc
     ec_robot/rpc_client.cc
     ec_robot/monitor.cc
-    ec_robot/streamer.cc
     ec_robot/robot.cc
+    ec_robot/streamer.cc
 )
 target_include_directories(ec_robot PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ec_robot PUBLIC asio::asio nlohmann_json::nlohmann_json Threads::Threads)
-target_compile_options(ec_robot PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(ec_robot PRIVATE -Wall -Wextra)
+# GCC 12/13 warn about asio's coroutine frame allocation (a false positive); everyone who
+# instantiates the client's coroutines would see it, so it's PUBLIC
+target_compile_options(ec_robot PUBLIC $<$<CXX_COMPILER_ID:GNU>:-Wno-mismatched-new-delete>)
+
+# Tests against the simulator: start `simulator --headless` first, then run them
+option(EC_BUILD_TESTS "Build the ec_robot tests (they need a running simulator)" ON)
+if(EC_BUILD_TESTS)
+    foreach(_test rpc monitor robot stream)
+        add_executable(test_${_test} ec_robot/tests/test_${_test}.cc)
+        target_link_libraries(test_${_test} PRIVATE ec_robot)
+    endforeach()
+endif()
 
 # ---------------------------------------------------------------------------
 # ec_emulator: the controller's state machine + servers on top of MuJoCo

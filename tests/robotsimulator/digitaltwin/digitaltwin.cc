@@ -63,7 +63,6 @@ struct Ui {
     double plan_speed = 30;       // deg/s, every joint (motion limits)
     double plan_acc = 60;         // deg/s^2
     bool plan_preview = true;
-    std::string refusal;          // why the last motion button was refused
     std::string ros_text = "ROS: not built in";
     // packet rate
     std::uint64_t packets = 0;
@@ -88,8 +87,8 @@ double max_abs_diff(const ec::Joints& a, const ec::Joints& b) {
     return m;
 }
 
-void show_result(const twin::Core& core) {
-    const twin::Outcome o = core.last_result();
+void show_result(const twin::View& v) {
+    const twin::Outcome& o = v.last;
     if (o.message.empty()) return;
     ImGui::Separator();
     if (!o.ok) ImGui::TextColored(kRed, "%s", o.message.c_str());
@@ -97,9 +96,9 @@ void show_result(const twin::Core& core) {
 }
 
 // --- panels -------------------------------------------------------------------------
-void observed_panel(twin::Core& core, const std::optional<ec::RobotStatus>& s, bool fresh, Ui& ui,
+void observed_panel(twin::Core& core, const twin::View& v, bool fresh, Ui& ui,
                     const mjModel* m, const mjData* d, int tcp_site) {
-    auto monitor = core.monitor();
+    const std::optional<ec::RobotStatus>& s = v.status;
     ImGui::SetNextWindowPos({10, 10}, ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize({470, 0}, ImGuiCond_Always);
     ImGui::Begin("Robot (observed)", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
@@ -107,17 +106,17 @@ void observed_panel(twin::Core& core, const std::optional<ec::RobotStatus>& s, b
     ImGui::Text("%s:8056", core.ip().c_str());
     ImGui::SameLine();
     if (!s) {
-        ImGui::TextColored(kRed, core.busy() ? "connecting..." : "no data");
+        ImGui::TextColored(kRed, v.connecting ? "connecting..." : "no data");
     } else if (!fresh) {
         ImGui::TextColored(kRed, "STALE (%.1f s old)", s->age_seconds());
     } else {
         ImGui::Text("%.0f packets/s, %.0f ms old", ui.rate, s->age_seconds() * 1000);
     }
-    if (monitor && monitor->invalid_packets() > 0) {
+    if (v.invalid_packets > 0) {
         ImGui::SameLine();
-        ImGui::TextColored(kRed, "%llu invalid", static_cast<unsigned long long>(monitor->invalid_packets()));
+        ImGui::TextColored(kRed, "%llu invalid", static_cast<unsigned long long>(v.invalid_packets));
     }
-    if ((!s || !fresh) && !core.busy()) {
+    if ((!s || !fresh) && !v.connecting) {
         ImGui::SameLine();
         if (ImGui::SmallButton("reconnect")) core.connect_monitor();
     }
@@ -178,17 +177,18 @@ void observed_panel(twin::Core& core, const std::optional<ec::RobotStatus>& s, b
 }
 
 
-void commands_panel(twin::Core& core, const std::optional<ec::RobotStatus>& s, bool /*fresh*/, Ui& ui, const mjModel* m) {
+void commands_panel(twin::Core& core, const twin::View& v, Ui& ui, const mjModel* m) {
+    const std::optional<ec::RobotStatus>& s = v.status;
     ImGui::SetNextWindowPos({10, 300}, ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize({470, 0}, ImGuiCond_Always);
     ImGui::Begin("Commands", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
 
-    auto robot = core.robot();
-    const bool external_running = core.active() == Source::External;
+    const bool connected = v.rpc_connected;
+    const bool external_running = v.active == Source::External;
 
     // 1. connection --------------------------------------------------------------
-    ImGui::BeginDisabled(core.busy() || core.active() != Source::None);
-    if (!robot) {
+    ImGui::BeginDisabled(v.busy || v.connecting || v.active != Source::None);
+    if (!connected) {
         if (ImGui::Button("connect 8055")) core.connect_robot();
         ImGui::SameLine();
         ImGui::TextWrapped("The controller takes one 8055 client: close other programs that use it first.");
@@ -196,8 +196,8 @@ void commands_panel(twin::Core& core, const std::optional<ec::RobotStatus>& s, b
         core.disconnect_robot();
     }
     ImGui::EndDisabled();
-    if (!robot) {
-        show_result(core);
+    if (!connected) {
+        show_result(v);
         ImGui::End();
         return;
     }
@@ -210,16 +210,16 @@ void commands_panel(twin::Core& core, const std::optional<ec::RobotStatus>& s, b
     ImGui::PopStyleColor(2);
 
     // 2. permissions ----------------------------------------------------------------
-    bool armed = core.armed();
-    ImGui::BeginDisabled(!armed && !core.can_arm());
+    bool armed = v.armed;
+    ImGui::BeginDisabled(!armed && !v.can_arm);
     if (ImGui::Checkbox("arm commands", &armed)) core.set_armed(armed);
     ImGui::EndDisabled();
     if (s && s->robot_mode != ec::Mode::Remote) {
         ImGui::SameLine();
         ImGui::TextColored(kRed, "robot not in remote mode");
     }
-    bool external = core.external_allowed();
-    ImGui::BeginDisabled(!core.armed());
+    bool external = v.external;
+    ImGui::BeginDisabled(!v.armed);
     if (ImGui::Checkbox("accept external commands", &external)) core.set_external_allowed(external);
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -230,14 +230,14 @@ void commands_panel(twin::Core& core, const std::optional<ec::RobotStatus>& s, b
 
     if (external_running) {
         ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.9f, 0.55f, 0.1f, 1));
-        ImGui::ProgressBar(static_cast<float>(core.progress()), {-1, 0}, "external motion running");
+        ImGui::ProgressBar(static_cast<float>(v.progress), {-1, 0}, "external motion running");
         ImGui::PopStyleColor();
-        ImGui::TextWrapped("%s", core.motion_text().c_str());
+        ImGui::TextWrapped("%s", v.motion_text.c_str());
         ImGui::TextColored(kGrey, "Your motion controls are locked. STOP, or untick \"accept external\", aborts it.");
     }
 
     // 3. operator commands ------------------------------------------------------------
-    const bool locked = !core.armed() || core.busy() || core.active() != Source::None;
+    const bool locked = !v.armed || v.busy || v.active != Source::None;
     ImGui::BeginDisabled(locked);
     ImGui::SetNextItemWidth(80);
     ImGui::InputInt("tool", &ui.tool);
@@ -293,11 +293,12 @@ void commands_panel(twin::Core& core, const std::optional<ec::RobotStatus>& s, b
     ImGui::EndDisabled();
     ImGui::EndDisabled();
 
-    show_result(core);
+    show_result(v);
     ImGui::End();
 }
 
-void motion_panel(twin::Core& core, const std::optional<ec::RobotStatus>& s, bool fresh, Ui& ui) {
+void motion_panel(twin::Core& core, const twin::View& v, bool fresh, Ui& ui) {
+    const std::optional<ec::RobotStatus>& s = v.status;
     ImGui::SetNextWindowPos({500, 10}, ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize({420, 0}, ImGuiCond_Always);
     ImGui::Begin("Motion", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
@@ -311,13 +312,13 @@ void motion_panel(twin::Core& core, const std::optional<ec::RobotStatus>& s, boo
     ImGui::SetNextItemWidth(120);
     ImGui::SliderScalar("deg/s^2", ImGuiDataType_Double, &ui.plan_acc, &a_lo, &a_hi, "%.0f");
 
-    ImGui::BeginDisabled(!fresh || core.busy() || core.active() != Source::None);
+    ImGui::BeginDisabled(!fresh || v.busy || v.active != Source::None);
     if (ImGui::Button("plan to target")) core.plan_to(ui.target);
     ImGui::EndDisabled();
     ImGui::SameLine();
     ImGui::TextDisabled("(target = the joint sliders)");
 
-    const auto plan = core.plan();
+    const auto& plan = v.plan;
     ImGui::Separator();
     if (!plan) {
         ImGui::TextDisabled("no plan");
@@ -331,20 +332,19 @@ void motion_panel(twin::Core& core, const std::optional<ec::RobotStatus>& s, boo
     if (ImGui::SmallButton("discard")) core.discard_plan();
 
     const double off = s ? max_abs_diff(s->q(), plan->traj.points.front()) : 1e9;
-    const char* why_not = !core.robot() ? "connect 8055 in Commands"
-                        : !core.armed() ? "arm commands in Commands"
-                        : core.active() == Source::External ? "an external motion is running"
+    const char* why_not = !v.rpc_connected ? "connect 8055 in Commands"
+                        : !v.armed ? "arm commands in Commands"
+                        : v.active == Source::External ? "an external motion is running"
                         : off > 0.5 ? "the arm is not at the plan's start: plan again"
-                        : core.busy() ? "busy"
+                        : v.busy || v.active != Source::None ? "busy"
                         : nullptr;
     ImGui::BeginDisabled(why_not != nullptr);
     if (ImGui::Button("execute plan", {-1, 30}) && !why_not) {
-        ui.refusal.clear();
-        if (!core.run_plan(plan, Source::Operator, {}, &ui.refusal)) ui.refusal = "refused: " + ui.refusal;
+        core.run_plan(plan, Source::Operator, {});   // a refusal shows up as the last result
     }
     ImGui::EndDisabled();
     if (why_not) ImGui::TextColored(off > 0.5 && s ? kRed : kGrey, "%s", why_not);
-    if (!ui.refusal.empty()) ImGui::TextColored(kRed, "%s", ui.refusal.c_str());
+    show_result(v);
     ImGui::End();
 }
 
@@ -421,41 +421,41 @@ int main(int argc, char** argv) {
 
         std::function<void()> rendering;
         rendering = [&]() {
-            core.update_permissions();
             core.set_limits(ui.plan_speed, ui.plan_acc);
             core.set_power_settings(ui.tool, ui.speed_override);
 
             // mirror the latest monitor packet
-            const std::optional<ec::RobotStatus> status = core.status();
+            const twin::View view = core.view();   // one consistent snapshot per frame
+            const std::optional<ec::RobotStatus>& status = view.status;
             const bool fresh = twin::Core::fresh(status);
             if (status) {
                 for (int i = 0; i < 6; ++i) data->qpos[model->jnt_qposadr[i]] = status->joint_pos[i] * kDeg;
                 mj_forward(model.get(), data.get());
                 if (!ui.target_set) { ui.target = status->q(); ui.target_set = true; }
             }
-            if (auto monitor = core.monitor()) {
+            {
                 const auto now = Clock::now();
                 const double dt = std::chrono::duration<double>(now - ui.rate_t).count();
                 if (dt >= 1.0) {
-                    ui.rate = (monitor->packets() - ui.packets) / dt;
-                    ui.packets = monitor->packets();
+                    ui.rate = (view.packets - ui.packets) / dt;
+                    ui.packets = view.packets;
                     ui.rate_t = now;
                 }
             }
 
             viewer.begin_frame();
-            observed_panel(core, status, fresh, ui, model.get(), data.get(), tcp_site);
-            commands_panel(core, status, fresh, ui, model.get());
-            motion_panel(core, status, fresh, ui);
+            observed_panel(core, view, fresh, ui, model.get(), data.get(), tcp_site);
+            commands_panel(core, view, ui, model.get());
+            motion_panel(core, view, fresh, ui);
 
             viewer.update_scene(data.get());
-            if (ui.show_ghost && core.robot() && status && max_abs_diff(ui.target, status->q()) > 0.05) {
+            if (ui.show_ghost && view.rpc_connected && status && max_abs_diff(ui.target, status->q()) > 0.05) {
                 for (int i = 0; i < 6; ++i) ghost->qpos[model->jnt_qposadr[i]] = ui.target[i] * kDeg;
                 mj_forward(model.get(), ghost.get());
                 viewer.add_ghost(ghost.get());
             }
             // the plan, replayed in blue (hidden while the arm is moving: then watch the arm)
-            if (auto plan = core.plan(); plan && ui.plan_preview && status &&
+            if (const auto& plan = view.plan; plan && ui.plan_preview && status &&
                                          status->robot_state != ec::State::Running) {
                 const ec::Joints& q = preview_pose(*plan);
                 for (int i = 0; i < 6; ++i) plan_ghost->qpos[model->jnt_qposadr[i]] = q[i] * kDeg;
@@ -478,7 +478,7 @@ int main(int argc, char** argv) {
         while (!viewer.should_close()) {
             context.run_one();
         }
-        if (core.active() != Source::None) core.stop("the twin closing").wait_for(1s);
+        // (a motion still running is stopped by the core's destructor)
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());

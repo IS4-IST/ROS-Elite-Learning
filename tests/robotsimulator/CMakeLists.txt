@@ -2,9 +2,8 @@ cmake_minimum_required(VERSION 3.22)
 
 project(robotsimulator VERSION 0.1.0 LANGUAGES C CXX)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 20)   # the robot client uses coroutines (asio::awaitable)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -81,12 +80,6 @@ if(EC_WITH_ROS AND EC_ROS_DIR)
     if(NOT DEFINED ENV{AMENT_PREFIX_PATH})
         set(ENV{AMENT_PREFIX_PATH} "${EC_ROS_DIR}")
     endif()
-    list(APPEND CMAKE_PREFIX_PATH "${EC_ROS_DIR}")   # after the other packages were found
-    # ROS's CMake scripts look up type supports through AMENT_PREFIX_PATH: set it for this
-    # CMake run only (it doesn't leak into your shell)
-    if(NOT DEFINED ENV{AMENT_PREFIX_PATH})
-        set(ENV{AMENT_PREFIX_PATH} "${EC_ROS_DIR}")
-    endif()
     # ...and they run Python helpers that import ROS's own modules (ament_package), which
     # setup.bash would put on PYTHONPATH: /opt/ros/<distro>/lib/python3.X/site-packages
     file(GLOB _ec_ros_python LIST_DIRECTORIES true
@@ -132,8 +125,6 @@ if(EC_WITH_ROS AND EC_ROS_DIR)
 elseif(EC_WITH_ROS)
     message(STATUS "ROS 2 not found: building without it (set -DEC_ROS_DIR=/opt/ros/<distro>)")
 endif()
-
-
 add_subdirectory(simulator)
 add_subdirectory(digitaltwin)
 add_subdirectory(planner)
