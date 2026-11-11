@@ -19,6 +19,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <deque>
 
 #include "ec_robot/types.hpp"
 
