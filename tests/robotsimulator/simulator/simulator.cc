@@ -4,7 +4,7 @@
 //
 //   --cold          start like a freshly booted robot: teach mode, brakes closed
 //   --bind ADDR     listen address (default 127.0.0.1; 0.0.0.0 to reach it from other machines)
-//   --headless      no window (servers + physics only; no cameras)
+//   --headless      no window (servers + physics only + camera)
 //   --camera NAME[:PORT]   stream the model's camera NAME as H.264 on PORT (default 5000,
 //                   5001, ... in order). Repeat for more cameras. Needs the window:
 //                   images are rendered with its OpenGL context.
