@@ -2,8 +2,9 @@ cmake_minimum_required(VERSION 3.22)
 
 project(robotsimulator VERSION 0.1.0 LANGUAGES C CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -131,6 +132,8 @@ if(EC_WITH_ROS AND EC_ROS_DIR)
 elseif(EC_WITH_ROS)
     message(STATUS "ROS 2 not found: building without it (set -DEC_ROS_DIR=/opt/ros/<distro>)")
 endif()
+
+
 add_subdirectory(simulator)
 add_subdirectory(digitaltwin)
 add_subdirectory(planner)

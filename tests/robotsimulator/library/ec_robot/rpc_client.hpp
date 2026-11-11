@@ -24,46 +24,58 @@
 
 namespace ec {
 
+// The controller's own error replies ("not in remote mode", ...) as an error_code category.
+// The code is the controller's numeric code; the message text is in Reply::value.
+const std::error_category& controller_category();
+ 
+struct Reply {
+    std::error_code ec;      // empty = ok
+    nlohmann::json value;    // decoded result, or the controller's error object
+};
+ 
 class RpcClient {
 public:
     static constexpr std::uint16_t kPort = 8055;
-
-    explicit RpcClient(std::string ip, std::uint16_t port = kPort,
-                       std::chrono::milliseconds timeout = std::chrono::milliseconds(2000));
+ 
+    RpcClient(asio::io_context& context, std::string ip, std::uint16_t port = kPort,
+              std::chrono::milliseconds timeout = std::chrono::milliseconds(2000));
     ~RpcClient();
     RpcClient(const RpcClient&) = delete;
     RpcClient& operator=(const RpcClient&) = delete;
-
-    void connect();
-    void close();
-    bool connected() const;
-
-    // Send a command and wait for its reply; returns the decoded result.
-    // Throws ECError on an error reply, timeout or lost connection.
-    nlohmann::json call(const std::string& method,
-                        const nlohmann::json& params = nlohmann::json::array(),
-                        std::optional<std::chrono::milliseconds> timeout = std::nullopt);
-
-    // Send without waiting for a reply. Only for commands configured not to reply,
-    // e.g. tt_put_servo_joint_to_buf after transparent_transmission_init(response_enable=0).
-    void notify(const std::string& method, const nlohmann::json& params);
-
+ 
+    asio::awaitable<std::error_code> connect();   // opens the socket and starts the reader
+    void close();                                 // fails every waiting call with not_connected
+    bool connected() const { return connected_; }
+ 
+    // Parameters by value: they live in the coroutine frame.
+    asio::awaitable<Reply> call(std::string method, nlohmann::json params = nlohmann::json::array(),
+                                std::optional<std::chrono::milliseconds> timeout = std::nullopt);
+    void notify(std::string method, nlohmann::json params);   // no reply expected
+ 
 private:
-    std::uint64_t send_locked(const std::string& method, const nlohmann::json& params);
-    std::string read_line_locked(Clock::time_point deadline, const std::string& method);
-
+    struct Pending {
+        explicit Pending(asio::io_context& context) : timer(context) {}
+        asio::steady_timer timer;   // expires = timeout; cancelled by the reader = reply arrived
+        bool done = false;
+        Reply reply;
+    };
+ 
+    std::uint64_t send(const std::string& method, const nlohmann::json& params);
+    asio::awaitable<void> writer();
+    asio::awaitable<void> reader();
+    void fail_all(std::error_code ec);
+ 
+    asio::io_context& context_;
     std::string ip_;
     std::uint16_t port_;
     std::chrono::milliseconds timeout_;
-    asio::io_context io_;
     asio::ip::tcp::socket socket_;
-    asio::streambuf buffer_;
-    mutable std::mutex mutex_;
+    std::atomic<bool> connected_{false};
+ 
     std::uint64_t next_id_ = 0;
-    bool connected_ = false;
+    std::deque<std::string> outbox_;   // deque: push_back keeps queued lines where they are
+    bool writing_ = false;
+    std::unordered_map<std::uint64_t, Pending*> pending_;
 };
-
-// Unwrap a JSON-text result (exposed for tests)
-nlohmann::json decode_result(const nlohmann::json& result);
 
 }  // namespace ec

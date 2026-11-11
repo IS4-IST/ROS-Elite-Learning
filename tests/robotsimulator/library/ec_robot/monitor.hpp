@@ -1,37 +1,35 @@
-// Reader for the Elite EC monitor interface, port 8056.
+// Async reader for the EC controller's monitor port 8056 (sketch).
 //
-// Reference: EC SDK-Socket Script Manual Ver3.19.2, chapter 3.
-//  - one big-endian packet roughly every 8 ms
-//  - 1024 bytes: 801 bytes of fields, reserved space, and a 4-byte matching
-//    word that must equal 0xEC8056EC, otherwise the packet is invalid
-//  - packets pile up if not read promptly, so a thread reads them continuously
-//    and only the newest one is kept
-// Units: joints deg, poses mm + rad, joint speed deg/s, torque Nm.
-// Verified on controller V3.11.2: 0 invalid packets; temperatures and torques
-// read -40 C / 0 while the servos are off.
+// The controller pushes a 1024-byte big-endian status packet every ~8 ms. One reader
+// coroutine on your io_context decodes them and keeps the latest. Expected failures come
+// back as std::error_code, never as exceptions.
+//
+// Threads: connect/close/wait_until run on the io_context's thread. latest() may be called
+// from any thread (the GUI, ROS): it is the one place with a lock, a copy under a mutex.
 #pragma once
-
-#include <asio.hpp>
-
+ 
+#include <utility>   // before asio.hpp: Asio 1.18.1 uses std::exchange without including it
+#include "asio.hpp"
+ 
 #include <array>
 #include <atomic>
-#include <condition_variable>
+#include <chrono>
 #include <cstdint>
 #include <functional>
+#include <list>
 #include <mutex>
 #include <optional>
 #include <string>
-#include <thread>
 #include <vector>
-
-#include "ec_robot/types.hpp"
-
+ 
+#include "ec_robot/types.hpp"   // Joints, Pose, Mode, State, Clock
+ 
 namespace ec {
-
+ 
 struct RobotStatus {
     Clock::time_point received{};     // local receive time
     bool valid = false;               // matching word present
-
+ 
     std::uint32_t message_size = 0;
     std::uint64_t timestamp_ms = 0;
     std::uint8_t cycle_mode = 0;
@@ -62,61 +60,80 @@ struct RobotStatus {
     std::array<double, 6> ext_tcp_force_tool{}; // N / Nm
     bool drag_enabled = false;
     bool force_sensor_connected = false;
-
+ 
     Joints q() const;            // 6 arm joints, deg
     Joints qd() const;           // 6 arm joint speeds, deg/s
     double age_seconds() const;  // time since received
 };
-
-// Decode one complete packet (exposed for tests). Fields that don't fit are left at defaults.
+ 
 RobotStatus decode_packet(const std::vector<std::uint8_t>& packet);
-
+ 
+// The monitor's own failures, beside the usual asio ones (refused, timed_out, ...)
+enum class MonitorErrc {
+    bad_packet_size = 1,   // the size field is implausible: not an EC monitor stream
+    no_matching_word,      // 50 packets in a row without 0xEC8056EC: layout differs from the manual
+    no_packets,            // connected, but nothing arrived within the timeout
+};
+std::error_code make_error_code(MonitorErrc e);
+ 
 class Monitor {
 public:
     static constexpr std::uint16_t kPort = 8056;
     static constexpr std::uint32_t kMatchingWord = 0xEC8056ECu;
-
-    explicit Monitor(std::string ip, std::uint16_t port = kPort, bool strict = true);
+ 
+    Monitor(asio::io_context& context, std::string ip, std::uint16_t port = kPort, bool strict = true,
+            std::chrono::milliseconds timeout = std::chrono::milliseconds(2000));
     ~Monitor();
     Monitor(const Monitor&) = delete;
     Monitor& operator=(const Monitor&) = delete;
-
-    // Connect and start the reader thread; waits up to `wait` for the first valid packet.
-    void start(std::chrono::milliseconds wait = std::chrono::milliseconds(2000));
-    void stop();
-
-    // Newest valid status; throws if none yet or older than max_age.
-    RobotStatus latest(std::chrono::milliseconds max_age = std::chrono::milliseconds(100)) const;
-
-    // Block until pred(status) holds; returns the status, or nullopt on timeout.
-    std::optional<RobotStatus> wait_for(const std::function<bool(const RobotStatus&)>& pred,
-                                        std::chrono::milliseconds timeout) const;
-
-    // Called from the reader thread for every valid packet; keep it fast.
-    void add_callback(std::function<void(const RobotStatus&)> fn);
-
+ 
+    // Connect, start the reader and wait for the first valid packet (all within the timeout).
+    asio::awaitable<std::error_code> connect();
+    void close();                          // wakes every waiter with not_connected
+    bool connected() const { return connected_; }
+ 
+    // Latest valid packet, if any, from any thread. No age check: look at age_seconds().
+    std::optional<RobotStatus> latest() const;
+ 
+    // Wait for the next packet for which pred(status) is true, or time out.
+    // Replaces polling loops with sleeps, e.g. "until state is Stop" or "until servos are on".
+    asio::awaitable<std::pair<std::error_code, RobotStatus>>
+    wait_until(std::function<bool(const RobotStatus&)> pred, std::chrono::milliseconds timeout);
+ 
     std::uint64_t packets() const { return packets_; }
     std::uint64_t invalid_packets() const { return invalid_packets_; }
-    std::string error() const;
-
+    std::error_code last_error() const;   // why the reader stopped, or a layout warning
+ 
 private:
-    void run();
-
+    struct Waiter {
+        explicit Waiter(asio::io_context& context) : timer(context) {}
+        std::function<bool(const RobotStatus&)> pred;
+        asio::steady_timer timer;   // expires = timeout; cancelled by the reader = condition met or closed
+        bool done = false;
+        std::error_code ec;
+        RobotStatus status;
+    };
+ 
+    asio::awaitable<void> reader();
+    void wake_all(std::error_code ec);
+ 
+    asio::io_context& context_;
     std::string ip_;
     std::uint16_t port_;
     bool strict_;
-    asio::io_context io_;
+    std::chrono::milliseconds timeout_;
     asio::ip::tcp::socket socket_;
-    std::thread thread_;
-    std::atomic<bool> stopping_{false};
-
-    mutable std::mutex mutex_;
-    mutable std::condition_variable cv_;
+    std::atomic<bool> connected_{false};
+ 
+    std::list<Waiter*> waiters_;          // only touched on the io_context's thread
+ 
+    mutable std::mutex mutex_;            // guards latest_ and error_ for readers on other threads
     std::optional<RobotStatus> latest_;
-    std::vector<std::function<void(const RobotStatus&)>> callbacks_;
-    std::string error_;
-    std::atomic<std::uint64_t> packets_{0};
-    std::atomic<std::uint64_t> invalid_packets_{0};
+    std::error_code error_;
+    std::atomic<std::uint64_t> packets_{0}, invalid_packets_{0};
 };
-
+ 
 }  // namespace ec
+ 
+template <>
+struct std::is_error_code_enum<ec::MonitorErrc> : std::true_type {};

@@ -1,32 +1,19 @@
 #include "ec_robot/rpc_client.hpp"
-
+#include <asio/experimental/awaitable_operators.hpp>
 #include <istream>
 
 namespace ec {
 
-const char* to_string(Mode m) {
-    switch (m) {
-        case Mode::Teach: return "teach";
-        case Mode::Play: return "play";
-        case Mode::Remote: return "remote";
-    }
-    return "unknown";
-}
-
-const char* to_string(State s) {
-    switch (s) {
-        case State::Stop: return "stop";
-        case State::Pause: return "pause";
-        case State::EStop: return "emergency stop";
-        case State::Running: return "running";
-        case State::Alarm: return "alarm";
-        case State::Collision: return "collision";
-    }
-    return "unknown";
-}
-
-nlohmann::json decode_result(const nlohmann::json& result) {
-    nlohmann::json value = result;
+namespace {
+ 
+class ControllerCategory : public std::error_category {
+public:
+    const char* name() const noexcept override { return "ec-controller"; }
+    std::string message(int code) const override { return "controller error " + std::to_string(code); }
+};
+ 
+// The controller sends results as JSON text, sometimes encoded twice ("\"V3.11.2\"")
+nlohmann::json decode_result(nlohmann::json value) {
     for (int i = 0; i < 3 && value.is_string(); ++i) {
         auto parsed = nlohmann::json::parse(value.get<std::string>(), nullptr, /*allow_exceptions=*/false);
         if (parsed.is_discarded()) break;   // a plain string, not JSON text
@@ -34,117 +21,143 @@ nlohmann::json decode_result(const nlohmann::json& result) {
     }
     return value;
 }
-
-RpcClient::RpcClient(std::string ip, std::uint16_t port, std::chrono::milliseconds timeout)
-    : ip_(std::move(ip)), port_(port), timeout_(timeout), socket_(io_) {}
-
-RpcClient::~RpcClient() { close(); }
-
-void RpcClient::connect() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    asio::ip::tcp::endpoint endpoint(asio::ip::make_address(ip_), port_);
-    std::error_code ec;
-    bool done = false;
-    socket_.async_connect(endpoint, [&](const std::error_code& e) { ec = e; done = true; });
-    io_.restart();
-    io_.run_for(timeout_);
-    if (!done) {
-        socket_.close();
-        io_.restart();
-        io_.run();
-        throw ECError("connect to " + ip_ + ":" + std::to_string(port_) + " timed out");
-    }
-    if (ec) throw ECError("connect to " + ip_ + ":" + std::to_string(port_) + " failed: " + ec.message());
-    socket_.set_option(asio::ip::tcp::no_delay(true));   // no Nagle delay on small messages
-    buffer_.consume(buffer_.size());
-    connected_ = true;
+ 
+} 
+ 
+const std::error_category& controller_category() {
+    static ControllerCategory category;
+    return category;
 }
-
-void RpcClient::close() {
-    std::lock_guard<std::mutex> lock(mutex_);
+ 
+RpcClient::RpcClient(asio::io_context& context, std::string ip, std::uint16_t port, std::chrono::milliseconds timeout)
+    : context_(context), ip_(std::move(ip)), port_(port), timeout_(timeout), socket_(context) {}
+ 
+RpcClient::~RpcClient() {
     std::error_code ignored;
-    socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
-    socket_.close(ignored);
-    connected_ = false;
+    socket_.close(ignored);   // directly: we're on the context's thread, or it has stopped
 }
-
-bool RpcClient::connected() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return connected_;
-}
-
-nlohmann::json RpcClient::call(const std::string& method, const nlohmann::json& params,
-                               std::optional<std::chrono::milliseconds> timeout) {
-    nlohmann::json reply;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const auto deadline = Clock::now() + timeout.value_or(timeout_);
-        const auto id = send_locked(method, params);
-        while (true) {
-            reply = nlohmann::json::parse(read_line_locked(deadline, method));
-            if (reply.value("id", std::uint64_t{0}) == id) break;
-            // reply to an earlier request (e.g. one that timed out): discard it
-        }
-    }
-    if (reply.contains("error")) {
-        const auto& err = reply["error"];
-        if (err.is_object()) {
-            throw ECError(method + ": " + err.value("message", std::string("error")),
-                          err.value("code", 0), method);
-        }
-        throw ECError(method + ": " + err.dump(), 0, method);
-    }
-    return decode_result(reply.value("result", nlohmann::json()));
-}
-
-void RpcClient::notify(const std::string& method, const nlohmann::json& params) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    send_locked(method, params);
-}
-
-std::uint64_t RpcClient::send_locked(const std::string& method, const nlohmann::json& params) {
-    if (!connected_) throw ECError("not connected", 0, method);
-    const auto id = ++next_id_;
-    nlohmann::json msg = {{"jsonrpc", "2.0"}, {"method", method}, {"params", params}, {"id", id}};
-    std::string text = msg.dump() + "\n";
+ 
+// --- connection -------------------------------------------------------------------------
+asio::awaitable<std::error_code> RpcClient::connect() {
     std::error_code ec;
-    asio::write(socket_, asio::buffer(text), ec);
+    const asio::ip::tcp::endpoint endpoint(asio::ip::make_address(ip_, ec), port_);
+    if (ec) co_return ec;
+ 
+    // Timeout: if the timer fires first it closes the socket, ending the connect with operation_aborted
+    asio::steady_timer timer(context_);
+    timer.expires_after(timeout_);
+    timer.async_wait([this](std::error_code e) {
+        if (!e) socket_.close();
+    });
+    co_await socket_.async_connect(endpoint, asio::redirect_error(asio::use_awaitable, ec));
+    const bool timed_out = timer.expiry() <= asio::steady_timer::clock_type::now();
+    timer.cancel();
     if (ec) {
+        std::error_code ignored;
+        socket_.close(ignored);
+        co_return (timed_out && ec == asio::error::operation_aborted) ? std::error_code(asio::error::timed_out) : ec;
+    }
+    socket_.set_option(asio::ip::tcp::no_delay(true), ec);   // no Nagle delay on small messages
+    if (ec) co_return ec;
+ 
+    connected_ = true;
+    asio::co_spawn(context_, reader(), asio::detached);    // one reader for the connection's life
+    co_return std::error_code{};
+}
+ 
+void RpcClient::close() {
+    asio::post(context_, [this] {
+        std::error_code ignored;
+        socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
+        socket_.close(ignored);   // the reader's pending read ends: it fails the waiting calls
         connected_ = false;
-        throw ECError(method + ": send failed: " + ec.message(), 0, method);
+    });
+}
+ 
+void RpcClient::fail_all(std::error_code ec) {
+    for (auto& [id, p] : pending_) {
+        p->done = true;
+        p->reply.ec = ec;
+        p->timer.cancel();        // wakes the waiting call
+    }
+}
+ 
+// --- writing: one queue, one writer --------------------------------------------------------
+std::uint64_t RpcClient::send(const std::string& method, const nlohmann::json& params) {
+    const std::uint64_t id = ++next_id_;
+    const nlohmann::json msg = {{"jsonrpc", "2.0"}, {"method", method}, {"params", params}, {"id", id}};
+    outbox_.push_back(msg.dump() + "\n");
+    if (!writing_) {
+        writing_ = true;
+        asio::co_spawn(context_, writer(), asio::detached);
     }
     return id;
 }
-
-std::string RpcClient::read_line_locked(Clock::time_point deadline, const std::string& method) {
-    // async read with a deadline: run the io_context only until the deadline
-    std::error_code ec;
-    std::size_t bytes = 0;
-    bool done = false;
-    asio::async_read_until(socket_, buffer_, '\n', [&](const std::error_code& e, std::size_t n) {
-        ec = e;
-        bytes = n;
-        done = true;
-    });
-    io_.restart();
-    const auto now = Clock::now();
-    if (deadline > now) io_.run_for(deadline - now);
-    if (!done) {
-        socket_.cancel();          // abort the pending read and let its handler run
-        io_.restart();
-        io_.run();
-        throw ECError(method + ": no reply within timeout", 0, method);
+ 
+asio::awaitable<void> RpcClient::writer() {
+    while (!outbox_.empty()) {
+        std::error_code ec;
+        co_await asio::async_write(socket_, asio::buffer(outbox_.front()),
+                                   asio::redirect_error(asio::use_awaitable, ec));
+        if (ec) {                 // connection gone: the reader notices and fails the waiting calls
+            outbox_.clear();
+            writing_ = false;
+            close();
+            co_return;
+        }
+        outbox_.pop_front();      // only now: the buffer had to live during the write
     }
-    if (ec) {
-        connected_ = false;
-        throw ECError(method + ": connection lost: " + ec.message(), 0, method);
-    }
-    std::istream in(&buffer_);
-    std::string line;
-    std::getline(in, line);
-    (void)bytes;
-    if (line.find_first_not_of(" \r\t") == std::string::npos) return read_line_locked(deadline, method);
-    return line;
+    writing_ = false;
 }
+ 
+void RpcClient::notify(std::string method, nlohmann::json params) {
+    if (connected_) send(method, params);
+}
+ 
+asio::awaitable<void> RpcClient::reader() {
+    asio::streambuf buffer;
+    for (;;) {
+        std::error_code ec;
+        const std::size_t n = co_await asio::async_read_until(socket_, buffer, '\n',
+                                                              asio::redirect_error(asio::use_awaitable, ec));
+        if (ec) {
+            connected_ = false;
+            fail_all(asio::error::not_connected);
+            co_return;
+        }
+        const std::string line(asio::buffers_begin(buffer.data()), asio::buffers_begin(buffer.data()) + n);
+        buffer.consume(n);
+ 
+        const auto msg = nlohmann::json::parse(line, nullptr, /*allow_exceptions=*/false);
+        if (msg.is_discarded() || !msg.contains("id") || !msg["id"].is_number_unsigned()) continue;
+        const auto it = pending_.find(msg["id"].get<std::uint64_t>());
+        if (it == pending_.end()) continue;   // a late reply after its call timed out: drop it
+        Pending& p = *it->second;
+        if (const auto err = msg.find("error"); err != msg.end()) {
+            const int code = err->is_object() ? err->value("code", -1) : -1;
+            p.reply.ec = std::error_code(code, controller_category());
+            p.reply.value = *err;                 // keeps the controller's message text
+        } else {
+            p.reply.value = decode_result(msg.value("result", nlohmann::json()));
+        }
+        p.done = true;
+        p.timer.cancel(); 
+    }
+}
+ 
+asio::awaitable<Reply> RpcClient::call(std::string method, nlohmann::json params,
+                                       std::optional<std::chrono::milliseconds> timeout) {
+    if (!connected_) co_return Reply{asio::error::not_connected, {}};
+    Pending p(context_);
+    p.timer.expires_after(timeout.value_or(timeout_));
+    const std::uint64_t id = send(method, params);
+    pending_[id] = &p;            // before we suspend: the reply can't be read earlier
+    std::error_code ignored;
+    co_await p.timer.async_wait(asio::redirect_error(asio::use_awaitable, ignored));
+    pending_.erase(id);           // before the frame (and p) goes away
+    if (!p.done) co_return Reply{asio::error::timed_out, {}};
+    co_return std::move(p.reply);
+}
+
 
 }  // namespace ec
