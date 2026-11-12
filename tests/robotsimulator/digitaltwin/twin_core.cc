@@ -286,8 +286,9 @@ void Core::set_power_settings(int tool, double speed_override) {
 template <typename T>
 asio::awaitable<T> Core::on_planning_thread(std::function<T()> fn) {
     // runs fn on the planning thread; the caller resumes on its own (robot) thread
+    auto callable = [fn = std::move(fn)]() -> asio::awaitable<T> { co_return fn(); };
     co_return co_await asio::co_spawn(planning_context_,
-                                      [fn = std::move(fn)]() -> asio::awaitable<T> { co_return fn(); },
+                                      std::move(callable),
                                       asio::use_awaitable);
 }
 
@@ -352,6 +353,7 @@ void Core::discard_plan() {
 // --- motions --------------------------------------------------------------------------------------------------
 void Core::start_motion(std::function<std::shared_ptr<const Plan>()> build, Source from, MotionCallbacks cb) {
     asio::post(robot_context_, [this, build = std::move(build), from, cb = std::move(cb)]() mutable {
+        std::printf("motion planning is computing\n");
         auto refuse = [&](const std::string& why) {
             finish({false, std::string("motion (") + to_string(from) + "): refused, " + why}, cb.done);
         };
@@ -370,6 +372,7 @@ void Core::start_motion(std::function<std::shared_ptr<const Plan>()> build, Sour
             std::lock_guard<std::mutex> lock(mutex_);
             motion_text_ = std::string(to_string(from)) + ": checking";
         }
+        std::printf("motion is starting\n");
         asio::co_spawn(robot_context_, motion(std::move(build), from, std::move(cb)), asio::detached);
     });
 }
@@ -377,7 +380,9 @@ void Core::start_motion(std::function<std::shared_ptr<const Plan>()> build, Sour
 asio::awaitable<void> Core::motion(std::function<std::shared_ptr<const Plan>()> build, Source from, MotionCallbacks cb) {
     const std::string what = std::string("motion (") + to_string(from) + ")";
     // time + check on the planning thread; the robot thread stays free meanwhile (STOP, monitor)
+    std::printf("passing info to the planning thread\n");
     const std::shared_ptr<const Plan> plan = co_await on_planning_thread<std::shared_ptr<const Plan>>(std::move(build));
+    std::printf("receiving info from the planning thread\n");
     Outcome o;
     if (!plan || plan->traj.points.empty()) {
         o = {false, what + ": refused, " + (plan ? plan->summary : std::string("no trajectory"))};
@@ -467,7 +472,7 @@ asio::awaitable<Outcome> Core::execute(const Plan& plan, Source from, const Moti
 }
 
 void Core::run_plan(std::shared_ptr<const Plan> plan, Source from, MotionCallbacks cb) {
-    start_motion([plan] { return plan; }, from, std::move(cb));
+    start_motion([plan] { std::printf("plan executing\n");return plan; }, from, std::move(cb));
 }
 
 // The build steps below run on the planning thread. A failed build returns a Plan with no
