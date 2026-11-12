@@ -1,0 +1,3 @@
+add_subdirectory(digitaltwin)
+add_subdirectory(planner)
+add_subdirectory(simulator)

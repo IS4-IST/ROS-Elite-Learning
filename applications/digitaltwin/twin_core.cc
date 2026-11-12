@@ -286,8 +286,9 @@ void Core::set_power_settings(int tool, double speed_override) {
 template <typename T>
 asio::awaitable<T> Core::on_planning_thread(std::function<T()> fn) {
     // runs fn on the planning thread; the caller resumes on its own (robot) thread
+    auto callable = [fn = std::move(fn)]() -> asio::awaitable<T> { co_return fn(); };
     co_return co_await asio::co_spawn(planning_context_,
-                                      [fn = std::move(fn)]() -> asio::awaitable<T> { co_return fn(); },
+                                      std::move(callable),
                                       asio::use_awaitable);
 }
 
