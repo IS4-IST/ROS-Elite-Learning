@@ -1,0 +1,39 @@
+menu "P4 camera streamer"
+
+    config P4CAM_PORT
+        int "TCP port of the H.264 stream"
+        default 5000
+        help
+            Clients connect here (twin: --camera NAME=HOST:PORT). 5000 is also the
+            simulator's first camera port.
+
+    config P4CAM_BITRATE_KBPS
+        int "Target bitrate (kbit/s)"
+        range 200 40000
+        default 4000
+
+    config P4CAM_GOP
+        int "Keyframe interval (frames)"
+        range 1 255
+        default 30
+        help
+            A keyframe at least every GOP frames. New and lagging clients get one at once anyway.
+
+    config P4CAM_QP_MIN
+        int "Minimum QP (lower = better quality, more bits)"
+        range 0 51
+        default 25
+
+    config P4CAM_QP_MAX
+        int "Maximum QP"
+        range 0 51
+        default 40
+
+    config P4CAM_NTP_SERVER
+        string "NTP server (used when DHCP doesn't provide one)"
+        default "pool.ntp.org"
+        help
+            capture_ns in the stream is the camera's clock. Point this at the PC that runs the
+            twin (e.g. its chrony server) so latency numbers are meaningful.
+
+endmenu

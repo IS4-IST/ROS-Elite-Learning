@@ -58,30 +58,30 @@ CMake looks for ROS 2 at `/opt/ros/$ROS_DISTRO`, else `/opt/ros/humble`, else
 ## Run
 
 ```bash
-./build/simulator/simulator                       # fake robot on 127.0.0.1:8055/8056
-./build/simulator/simulator --cold                # boots like the real one: teach mode, brakes closed
-./build/simulator/simulator --bind 0.0.0.0        # reachable from other machines
-./build/simulator/simulator --headless            # no window
+./build/applications/simulator/simulator                       # fake robot on 127.0.0.1:8055/8056
+./build/applications/simulator/simulator --cold                # boots like the real one: teach mode, brakes closed
+./build/applications/simulator/simulator --bind 0.0.0.0        # reachable from other machines
+./build/applications/simulator/simulator --headless            # no window
 
-./build/digitaltwin/digitaltwin                   # follow (and command) the robot at 192.168.0.11
-./build/digitaltwin/digitaltwin --ip 127.0.0.1    # the simulator instead
+./build/applications/digitaltwin/digitaltwin                   # follow (and command) the robot at 192.168.0.11
+./build/applications/digitaltwin/digitaltwin --ip 127.0.0.1    # the simulator instead
 #   --max-change 30   largest change of one "move joint" (deg)
 #   --margin 10       clearance kept by planning and checked on every motion (mm)
 #   --no-ros          don't start the ROS interface even if it was built
 
-./build/planner/planner --goal -90 -90 90 -90 90 0              # plan from /joint_states, print
-./build/planner/planner --goal -90 -90 90 -90 90 0 --execute    # ...and send it to the twin
-./build/planner/planner --start home --goal ...                 # offline, no twin needed
+./build/applications/planner/planner --goal -90 -90 90 -90 90 0              # plan from /joint_states, print
+./build/applications/planner/planner --goal -90 -90 90 -90 90 0 --execute    # ...and send it to the twin
+./build/applications/planner/planner --start home --goal ...                 # offline, no twin needed
 ```
 
 **Give all three the same scene file.** The simulator and twin take it as the first
-argument, the planner as `--model`. For example, with `library/models/scene_pillar.xml`
+argument, the planner as `--model`. For example, with `libraries/models/scene_pillar.xml`
 (the scene plus an obstacle):
 
 ```bash
-./build/simulator/simulator library/models/scene_pillar.xml
-./build/digitaltwin/digitaltwin library/models/scene_pillar.xml --ip 127.0.0.1
-./build/planner/planner --model library/models/scene_pillar.xml --goal -90 -90 90 -90 90 0 --execute
+./build/applications/simulator/simulator libraries/models/scene_pillar.xml
+./build/applications/digitaltwin/digitaltwin libraries/models/scene_pillar.xml --ip 127.0.0.1
+./build/applications/planner/planner --model libraries/models/scene_pillar.xml --goal -90 -90 90 -90 90 0 --execute
 ```
 
 Mouse: left drag rotates, right drag moves, shift for the horizontal variant, wheel zooms.
@@ -93,9 +93,9 @@ The simulator can play your cameras too: it renders a model camera offscreen, en
 as H.264 and serves it on a TCP port, the way the ESP32-P4 nodes will.
 
 ```bash
-./build/simulator/simulator library/models/scene_pillar.xml --camera scene_cam --camera wrist_cam:5001
+./build/applications/simulator/simulator libraries/models/scene_pillar.xml --camera scene_cam --camera wrist_cam:5001
 nc 127.0.0.1 5000 | ffplay -f h264 -fflags nobuffer -           # watch it
-./build/library/camera_probe 127.0.0.1 5000                    # fps, keyframes, kbit/s, latency
+./build/libraries/camera_probe 127.0.0.1 5000                    # fps, keyframes, kbit/s, latency
 ```
 
 Options: `--camera NAME[:PORT]` (repeat; ports from 5000), `--camera-size 640x480`,
@@ -105,14 +105,14 @@ with no client isn't rendered or encoded.
 
 The stream is plain H.264 Annex-B, nothing else on the wire, so any H.264 decoder plays
 it. Each frame carries an SEI unit with its frame id and capture time (Unix ns); the
-format is in `library/camera/stream_format.h`, and the P4 firmware should send the same.
+format is in `libraries/camera/stream_format.h`, and the P4 firmware should send the same.
 Baseline profile, no B-frames, SPS/PPS on every keyframe. A new client gets a keyframe at
 once; a client too slow for a frame skips to the next keyframe instead of queueing.
 
 ### Watching the cameras in the twin
 
 ```bash
-./build/digitaltwin/digitaltwin library/models/scene_pillar.xml --ip 127.0.0.1 \
+./build/applications/digitaltwin/digitaltwin libraries/models/scene_pillar.xml --ip 127.0.0.1 \
     --camera scene=127.0.0.1:5000 --camera wrist=127.0.0.1:5001
 ```
 
@@ -205,8 +205,8 @@ ros2 service call /stop std_srvs/srv/Trigger
 ## Planner
 
 ```bash
-./build/planner/planner --model library/models/scene_pillar.xml --goal -90 -90 90 -90 90 0 --execute
-./build/planner/planner ... --execute --timed --speed 30 --acc 60   # send dense samples timed here
+./build/applications/planner/planner --model libraries/models/scene_pillar.xml --goal -90 -90 90 -90 90 0 --execute
+./build/applications/planner/planner ... --execute --timed --speed 30 --acc 60   # send dense samples timed here
 ```
 
 It prints whether the plain joint move would have been collision-free, the waypoints,
@@ -220,7 +220,7 @@ It then prints the twin's feedback and the result. Ctrl+C cancels the goal, whic
 Options: `--margin` mm (default 10), `--speed`/`--acc` per joint (default 30 deg/s,
 60 deg/s²), `--algorithm`, `--timeout`, `--attempts`, `--start` (offline).
 
-How it plans (`library/planning/`):
+How it plans (`libraries/planning/`):
 
 - **Collisions:** MuJoCo on a private copy of the model. A pose is valid when every moving
   link stays at least `margin` from everything else, including the arm's own non-adjacent
@@ -261,7 +261,7 @@ Library tests (no ROS needed; start `build/simulator/simulator` first):
 
 ```
 CMakeLists.txt                 dependencies (MuJoCo, ImGui, Asio, nlohmann_json, GLFW, OMPL, optional ROS 2)
-library/
+libraries/
   common.*                     model loading, home keyframe, helpers
   viewer.*                     GLFW window + MuJoCo scene + mouse camera + ImGui
   ros_env.h                    run a ROS program without sourcing (sets env, restarts once)

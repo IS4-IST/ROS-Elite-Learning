@@ -1,0 +1,9 @@
+dependencies:
+  idf: ">=5.4"
+  esp_video: ">=2.2,<3.0"
+  espressif/esp_h264: "1.4.*"        # same series esp_video uses
+  espressif/asio: "^1.32.0"
+  espressif/ip101:
+    version: "^1.0.0"
+    rules:
+      - if: "idf_version >= 6.0"

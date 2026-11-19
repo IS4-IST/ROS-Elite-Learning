@@ -1,0 +1,44 @@
+# Waveshare ESP32-P4-ETH (chip v3.x, 32 MB PSRAM, 16 MB flash used)
+CONFIG_IDF_TARGET="esp32p4"
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=n
+CONFIG_ESP32P4_REV_MIN_300=y
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_FREERTOS_HZ=1000
+
+# Camera: OV5647 ("RPi Camera (B)"), 1280x960 = 2x2 binning of the whole sensor, 45 fps.
+# The ISP turns RAW10 into YUV420 for the H.264 encoder.
+CONFIG_CAMERA_OV5647=y
+CONFIG_CAMERA_OV5647_AUTO_DETECT_MIPI_INTERFACE_SENSOR=y
+CONFIG_CAMERA_OV5647_MIPI_RAW10_1280X960_BINNING_45FPS=y
+CONFIG_CAMERA_OV5647_MIPI_DEFAULT_FMT_RAW10_1280X960_BINNING_45FPS=y
+CONFIG_CAMERA_SC2336=y
+CONFIG_ESP_VIDEO_ENABLE_MIPI_CSI_VIDEO_DEVICE=y
+CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER=y
+
+# Network. NTP server from DHCP when offered.
+CONFIG_LWIP_DHCP_GET_NTP_SRV=y
+CONFIG_LWIP_SNTP_MAX_SERVERS=2
+# Ethernet TX ring: 30 full-size buffers (one 1514-byte frame each, ~44 KB). When the ring is
+# full the driver silently drops the frame and TCP only recovers by its retransmission timer
+# (hundreds of ms): that's what stalled the stream. So the ring must hold more than TCP can
+# have in flight.
+CONFIG_ETH_DMA_BUFFER_SIZE=1600
+CONFIG_ETH_DMA_TX_BUFFER_NUM=30
+# TCP: send buffer larger than a P-frame (~13 KB) so a frame goes out without waiting for ACKs,
+# but smaller than the TX ring above (32 KB = 23 segments < 30 buffers).
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
+CONFIG_LWIP_TCP_MSS=1460
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
+# lwIP retries a send that the driver refused only on the next ACK or on its TCP timer (default
+# 250 ms). The probe's latency sat at ~250 ms, i.e. frames waited for that timer. 20 ms makes such
+# stalls short while we find why sends are refused (the timer also paces retransmissions).
+CONFIG_LWIP_TCP_TMR_INTERVAL=20
