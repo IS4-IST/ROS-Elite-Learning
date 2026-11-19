@@ -25,7 +25,10 @@ bool parse_camera_source(const std::string& text, int index, CameraSource& out) 
 
 CameraView::CameraView(asio::io_context& io, CameraSource source, int index)
     : source_(std::move(source)), index_(index), client_(io, source_.host, source_.port) {
-    client_.on_frame([this](const camera::DecodedFrame& image, const camera::FrameStamp&) { upload(image); });
+    client_.on_frame([this](const camera::DecodedFrame& image, const camera::FrameStamp&) { 
+        upload(image); 
+        if (listener_) listener_(image, stamp);
+    });
     client_.start();
 }
 

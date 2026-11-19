@@ -31,10 +31,13 @@ public:
 
     void draw();   // between viewer.begin_frame() and end_frame()
 
+    void set_listener(camera::Client::FrameCallback listener) { listener_ = std::move(listener); }
+
 private:
     void upload(const camera::DecodedFrame& image);
 
     CameraSource source_;
+    camera::Client::FrameCallback listener_;
     int index_;
     camera::Client client_;
     unsigned int texture_ = 0;
