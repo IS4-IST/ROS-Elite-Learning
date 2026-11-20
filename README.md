@@ -247,26 +247,6 @@ How it plans (`libraries/planning/`):
 whatever you add. They don't see the table, the camera mount or people. Model the cell
 before trusting either on the real arm.
 
-## Tested on the simulator (pillar scene, ROS 2 Humble)
-
-| test | result |
-|---|---|
-| goal without the operator's grant | aborted: "the operator has not granted external control" |
-| path goal (twin times it) | 3 waypoints, arrived within 0.01°, feedback every 0.5 s |
-| `--timed` at the twin's limits | 733 samples, done |
-| `--timed` at 90 deg/s (twin allows 30) | refused: joint 1 above the acceleration limit |
-| Ctrl+C on the planner mid-motion | canceled, arm stopped at joint 1 = −50° |
-| operator unticks the grant mid-motion | aborted "stopped: the operator withdrew external control", arm stopped |
-| operator STOP mid-motion | aborted "stopped by the operator", arm stopped |
-| operator "plan to target" + execute | done |
-| goal to where the arm already is | done: "already at the goal, nothing to do" |
-| twin closed (SIGINT) mid-motion | twin stops the arm and exits; planner: "FAILED the twin's action server disappeared" (exit 4) |
-| `/power`, `/stop` without 8055 | `success=false` with the reason |
-
-Library tests (no ROS needed; start `build/simulator/simulator` first):
-`build/library/test_rpc`, `test_monitor`, `test_robot`, `test_stream`. Turn them off with
-`-DEC_BUILD_TESTS=OFF`.
-
 ## Layout
 
 ```
@@ -330,14 +310,14 @@ Threads:
   delays `/stop`, the joint states or the action. Every core call takes a callback; nothing
   returns a future to wait on.
 
-## The robot library (`ec_robot`) in short
+## The robot library (`ec_robot`)
 
 - Everything is `asio::awaitable` on the caller's `io_context`. No locks except the
   monitor's latest-status copy, no threads of its own.
 - Expected failures are `std::error_code` (categories `ec-controller`, `ec-monitor`,
-  `ec-robot`, `ec-stream`), with `last_error_detail()` for the human-readable reason.
+  `ec-robot`, `ec-stream`), with `last_error_detail()` with a human-readable reason.
   Nothing throws for a refused command, a timeout or a lost connection.
-- Builds with the Asio in Ubuntu 22.04 (1.18.1): no awaitable operators, no `as_tuple`;
+- Builds with Asio in Ubuntu 22.04 (1.18.1): no awaitable operators, no `as_tuple`;
   timeouts are timers that close the socket or cancel a wait.
 - GCC 11–13 coroutine pitfalls avoided in this code: no braced init list inside a
   `co_await` expression (internal compiler error), no structured bindings on a
@@ -364,7 +344,7 @@ It does **not** reproduce the real arm's dynamics. The servo gains in `scene.xml
 (kp 20000/5000) so the arm settles within 0.01° in about 0.2 s. With the old gains the
 in-position check timed out. Masses, friction and armature come from the URDF or are
 guesses, so they aren't identified from the real arm. The 100 ms lookahead vibration seen
-on the real robot doesn't show up here.
+on the real robot doesn't show up here. (we need to use system identification tools to identify the properties of the system in real time)
 
 ## Model notes (check before trusting the dynamics)
 
@@ -372,4 +352,4 @@ on the real robot doesn't show up here.
 - **Joint 2 range** is [-180, 0] deg in the URDF, which is probably tighter than the hardware.
   The twin shows an observed angle in red when it falls outside the model's range.
 - Collision geometry uses the full visual meshes. That's fine for one arm. For contact-heavy
-  scenes, replace it with simpler shapes.
+  scenes, replace it with simpler shapes. (maybe spheres or spheroids around each joint?)
