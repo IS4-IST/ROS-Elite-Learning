@@ -18,8 +18,10 @@ MuJoCo tools for the Elite **EC66**, in C++ with plain CMake:
                       8055 / 8056                     ROS 2 (optional)
 simulator or EC66  <-------------->  digitaltwin  <-------------------->  planner, policies, ...
                                      (GUI + core)    /joint_states /robot_status
+                                                      /cameras/<name>/image_raw
                                                       /stop /power /clear_alarm
                                                       /follow_joint_trajectory
+                                                      /joint_command (streams)
 ```
 
 ## Build
@@ -142,8 +144,7 @@ All commands, from the GUI or from ROS, go through one object, `twin::Core`
   connects. That's why everything else goes through the twin.
 
 Other guards:
-- **`move joint`** (one `moveByJoint`) is refused above `--max-change` (default 30°). In
-  testing, one careless slider drag asked for 294°.
+- **`move joint`** (one `moveByJoint`) is refused above `--max-change` (default 30°).
 - **`power on`** sets the tool chosen in the GUI (default 1, the lab's 0.3 kg tool) and the
   speed override, both for the GUI and for `/power`.
 - **Model check:** the observed panel compares the MuJoCo flange (site `tcp`) at the reported
@@ -175,14 +176,23 @@ is the joint-slider target.
 
 | name | type | |
 |---|---|---|
-| `/joint_states` | `sensor_msgs/JointState` | every monitor packet (125 Hz); rad, rad/s, Nm; `joint1`..`joint6` |
-| `/robot_status` | `diagnostic_msgs/DiagnosticStatus` | 10 Hz: mode, state, servo, synced, estop, collision, connected_8055, armed, external_control, active_motion, progress. Level OK / WARN (servos off, not remote) / ERROR (alarm, collision, e-stop, stale). |
+| `/joint_states` | `sensor_msgs/JointState` | every monitor packet (125 Hz); rad, rad/s, Nm; `joint1`..`joint6`; stamped with the packet's arrival time (system clock) |
+| `/robot_status` | `diagnostic_msgs/DiagnosticStatus` | 10 Hz: mode, state, servo, synced, estop, collision, connected_8055, armed, external_control, active_motion, progress, stream, stream_targets, stream_refused, stream_text. Level OK / WARN (servos off, not remote) / ERROR (alarm, collision, e-stop, stale). |
+| `/cameras/<name>/image_raw` | `sensor_msgs/Image` | every decoded frame of each `--camera NAME=...`, rgb8, stamped with its capture time; best-effort QoS (subscribe with the sensor-data profile) |
+| `/joint_command` | `sensor_msgs/JointState` | streamed joint targets (rad), one per message, for a policy or teleop; see "Streams" below; best-effort QoS |
 | `/stop` | `std_srvs/Trigger` | always allowed |
 | `/power` | `std_srvs/SetBool` | true = tool + power on + speed override, false = off; needs the grant |
 | `/clear_alarm` | `std_srvs/Trigger` | needs the grant |
 | `/follow_joint_trajectory` | `control_msgs/action/FollowJointTrajectory` | motions, see below |
 
-The camera publisher comes later.
+**Streams** (`/joint_command`): the first target starts a stream, if the operator granted
+external control, nothing else runs, the arm is stopped and the target is within 2 deg of it.
+Every target is checked: at most `--stream-max-step` (5 deg) from the previous one, joint limits,
+collisions on the way. A bad target ends the stream, and so does silence for
+`--stream-timeout` (300 ms), STOP or the grant being withdrawn; the arm holds the last good
+target. The controller plays the targets through transparent transmission (`ec::Streamer`,
+lookahead `--stream-lookahead`, speed limit `--stream-speed`). In **shadow mode** (checkbox, or
+`--shadow`) targets are only checked and drawn as an orange ghost, never sent.
 
 **The action:**
 - **Path or timed.** If every `time_from_start` is 0, it's a **path** and the twin times it.

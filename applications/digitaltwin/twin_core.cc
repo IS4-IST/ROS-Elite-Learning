@@ -44,7 +44,8 @@ const char* to_string(Source s) {
 // --- lifetime --------------------------------------------------------------------------------
 Core::Core(const mjModel* model, std::string ip, ec::planning::Options plan_options)
     : ip_(std::move(ip)),
-      planner_(model, std::move(plan_options)),
+      planner_(model, plan_options),
+      checker_(model, plan_options),
       robot_work_(robot_context_.get_executor()),
       planning_work_(planning_context_.get_executor()),
       robot_(std::make_unique<ec::Robot>(robot_context_, ip_)),
@@ -70,7 +71,8 @@ Core::~Core() {
     planning_context_.stop();
     robot_thread_.join();
     planning_thread_.join();
-    robot_.reset();   // sockets go before their io_context
+    streamer_.reset();   // a stream cut short: its timers before the robot and the context
+    robot_.reset();      // sockets go before their io_context
 }
 
 // --- view (any thread) -------------------------------------------------------------------------
@@ -97,6 +99,7 @@ View Core::view() const {
     v.motion_text = motion_text_;
     v.last = last_;
     v.plan = plan_;
+    v.stream = stream_view_;
     return v;
 }
 
@@ -550,6 +553,223 @@ void Core::run_timed(ec::planning::Trajectory traj, Source from, MotionCallbacks
             return describe("timed trajectory of " + std::to_string(n) + " points (sender's timing)", std::move(dense));
         },
         from, std::move(cb));
+}
+
+// --- streams -------------------------------------------------------------------------------------------------------
+void Core::update_stream_view(const std::function<void(StreamView&)>& change) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    change(stream_view_);
+}
+
+void Core::set_stream_settings(const StreamSettings& settings) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stream_settings_ = settings;
+}
+
+void Core::stream_target(const Joints& q, Source from) {
+    asio::post(robot_context_, [this, q, from] { handle_target(q, from); });
+}
+
+void Core::end_stream(const std::string& reason) {
+    asio::post(robot_context_, [this, reason] {
+        if (stream_source_ == Source::None) return;
+        end_requested_ = true;
+        end_reason_ = reason;
+    });
+}
+
+void Core::set_shadow(bool on) {
+    asio::post(robot_context_, [this, on] {
+        shadow_ = on;
+        shadow_previous_.reset();
+        update_stream_view([on](StreamView& v) {
+            v.shadow = on;
+            v.target.reset();
+            v.text = on ? "shadow mode: targets are checked and shown, not sent" : "shadow mode off";
+        });
+        if (on && stream_source_ != Source::None) {
+            end_requested_ = true;
+            end_reason_ = "shadow mode switched on";
+        }
+    });
+}
+
+// robot thread: the checks every target goes through
+std::optional<std::string> Core::check_target(const Joints& from_q, const Joints& q, const StreamSettings& set) {
+    const double step = max_abs_diff(from_q, q);
+    char text[160];
+    if (step > set.max_step) {
+        std::snprintf(text, sizeof text, "a jump of %.1f deg from the previous target (max %.1f)", step, set.max_step);
+        return std::string(text);
+    }
+    // joint limits and collisions, at q and on the straight way there
+    ec::planning::Trajectory way;
+    way.times = {0.0, 1.0};
+    way.points = {from_q, q};
+    return checker_.verify(way);
+}
+
+void Core::handle_target(const Joints& q, Source from) {
+    StreamSettings set;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        set = stream_settings_;
+        ++stream_view_.targets;
+    }
+    const auto now = Clock::now();
+    auto show = [&](bool ok, const std::string& text) {
+        update_stream_view([&](StreamView& v) {
+            v.target = q;
+            v.target_ok = ok;
+            if (!ok) ++v.refused;
+            if (!text.empty()) v.text = text;
+        });
+    };
+
+    // shadow mode: check, show, never send
+    if (shadow_) {
+        const auto s = robot_->status();
+        Joints previous = q;
+        if (shadow_previous_ && now - shadow_previous_time_ < 1s) previous = *shadow_previous_;
+        else if (fresh(s)) previous = s->q();   // a new run of targets starts at the arm
+        shadow_previous_ = q;
+        shadow_previous_time_ = now;
+        const auto why = check_target(previous, q, set);
+        show(!why, why ? "shadow: this target would be refused: " + *why : "shadow: target ok (not sent)");
+        return;
+    }
+
+    // a stream is running: the next target
+    if (stream_source_ != Source::None) {
+        if (from != stream_source_) {
+            show(false, std::string("refused: a stream from ") + to_string(stream_source_) + " is running");
+            return;
+        }
+        if (end_requested_) return;   // ending: the arm stops at the last good target
+        if (const auto why = check_target(last_target_, q, set)) {
+            show(false, "refused target, stream ended: " + *why);
+            end_requested_ = true;
+            end_reason_ = "refused target: " + *why;
+            return;
+        }
+        last_target_ = q;
+        last_target_time_ = now;
+        if (stream_running_) streamer_->set_target(q);   // before that, stream_loop sends the latest
+        show(true, {});
+        return;
+    }
+
+    // no stream yet: this target may start one
+    std::string why;
+    const auto s = robot_->status();
+    char text[200];
+    if (!allowed(from, &why)) return show(false, "stream refused: " + why);
+    if (active_ != Source::None) return show(false, "stream refused: a motion is running");
+    if (!fresh(s)) return show(false, "stream refused: no fresh robot state");
+    if (s->robot_state != ec::State::Stop)
+        return show(false, std::string("stream refused: the robot is not stopped (state: ") + ec::to_string(s->robot_state) + ")");
+    const double off = max_abs_diff(q, s->q());
+    if (off > set.start_tolerance) {
+        std::snprintf(text, sizeof text, "stream refused: the first target is %.1f deg from the arm (max %.1f)", off,
+                      set.start_tolerance);
+        return show(false, text);
+    }
+    if (const auto bad = check_target(s->q(), q, set)) return show(false, "stream refused: " + *bad);
+
+    cancel_ = false;
+    cancel_reason_.clear();
+    end_requested_ = false;
+    end_reason_.clear();
+    progress_ = 0;
+    active_ = from;
+    stream_source_ = from;
+    last_target_ = q;
+    last_target_time_ = now;
+    update_stream_view([&](StreamView& v) {
+        v.active = true;
+        v.source = from;
+        v.target = q;
+        v.target_ok = true;
+        v.text = std::string("stream (") + to_string(from) + "): starting";
+    });
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        motion_text_ = std::string(to_string(from)) + ": stream starting";
+    }
+    asio::co_spawn(robot_context_, stream_loop(from), asio::detached);
+}
+
+asio::awaitable<void> Core::stream_loop(Source from) {
+    const std::string what = std::string("stream (") + to_string(from) + ")";
+    StreamSettings set;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        set = stream_settings_;
+    }
+    ec::StreamerConfig cfg;
+    cfg.lookahead_ms = set.lookahead_ms;
+    cfg.max_joint_speed = set.max_speed;
+    for (int j = 0; j < 6; ++j) {
+        cfg.joint_min[j] = checker_.lower(j);
+        cfg.joint_max[j] = checker_.upper(j);
+    }
+    streamer_ = std::make_unique<ec::Streamer>(*robot_, cfg);
+
+    Outcome o;
+    const std::error_code started = co_await streamer_->start();
+    if (started) {
+        o = {false, what + ": could not start: " + started.message() + " " + streamer_->error_detail()};
+    } else if (cancel_) {
+        o = {false, what + ": " + cancel_reason_, true};
+        co_await streamer_->stop(/*settle=*/false);
+    } else {
+        stream_running_ = true;
+        streamer_->set_target(last_target_);   // the latest, which may have changed while starting
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            motion_text_ = what + ": running";
+        }
+        update_stream_view([&](StreamView& v) { v.text = what + ": running"; });
+
+        std::string reason;
+        bool normal_end = false, stopped = false;
+        asio::steady_timer tick(robot_context_);
+        for (;;) {
+            tick.expires_after(10ms);
+            std::error_code ignored;
+            co_await tick.async_wait(asio::redirect_error(asio::use_awaitable, ignored));
+            if (cancel_) { reason = cancel_reason_; stopped = true; break; }
+            if (end_requested_) { reason = end_reason_; break; }
+            if (!streamer_->running()) {
+                reason = "the streamer aborted: " + streamer_->error().message() + " " + streamer_->error_detail();
+                stopped = true;   // it sent stop itself
+                break;
+            }
+            const auto silent = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - last_target_time_);
+            if (silent.count() > set.timeout_ms) {
+                reason = "no target for " + std::to_string(set.timeout_ms) + " ms, the arm holds the last one";
+                normal_end = true;
+                break;
+            }
+        }
+        stream_running_ = false;
+        // settle: the arm reaches the last target; after a STOP or an abort it already stopped
+        co_await streamer_->stop(/*settle=*/!stopped);
+        o = {normal_end, what + " ended: " + reason, true};
+    }
+    streamer_.reset();
+    stream_source_ = Source::None;
+    active_ = Source::None;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        motion_text_ = o.message;
+    }
+    update_stream_view([&](StreamView& v) {
+        v.active = false;
+        v.source = Source::None;
+        v.text = o.message;
+    });
+    finish(o, {});
 }
 
 }  // namespace twin

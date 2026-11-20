@@ -27,6 +27,9 @@
 // densifies them to 8 ms and checks every sample and the motion between samples for
 // collisions in the twin's own scene. Back on the robot thread: arm still at the start
 // (0.5 deg)? upload (STOP overtakes it and cancels it) -> run -> feedback ~20 Hz -> result.
+//
+// Streams are the other kind of motion: joint targets one at a time (a policy, teleop),
+// played through the controller's transparent transmission. See stream_target().
 #pragma once
 
 #include <mujoco/mujoco.h>
@@ -45,6 +48,7 @@
 #include <vector>
 
 #include "ec_robot/robot.h"
+#include "ec_robot/streamer.h"
 #include "planning/planner.h"
 
 namespace twin {
@@ -76,6 +80,26 @@ struct MotionCallbacks {
     Callback done;   // exactly once: refused, finished, failed or stopped
 };
 
+// Streamed joint targets (see Core::stream_target)
+struct StreamSettings {
+    double max_step = 5;          // deg: largest change between consecutive targets
+    double start_tolerance = 2;   // deg: the first target must be this close to the arm
+    int timeout_ms = 300;         // no target for this long ends the stream (dead man)
+    int lookahead_ms = 200;       // controller lookahead (on V3.11.2, 100 ms vibrates)
+    double max_speed = 30;        // deg/s, every joint: the streamer's setpoints never go faster
+};
+
+struct StreamView {
+    bool active = false;            // a stream is running (targets go to the robot)
+    bool shadow = false;            // shadow mode: targets are checked and shown, never sent
+    Source source = Source::None;   // who is streaming
+    std::uint64_t targets = 0;      // received since the twin started
+    std::uint64_t refused = 0;      // of those, refused by the checks
+    std::optional<Joints> target;   // the latest target (sent, or only shown in shadow mode)
+    bool target_ok = true;          // it passed the checks
+    std::string text;               // what happened last
+};
+
 // Everything a front end shows, copied in one go (any thread)
 struct View {
     std::optional<ec::RobotStatus> status;   // latest monitor packet, possibly stale
@@ -90,6 +114,7 @@ struct View {
     bool busy = false;                       // an operator command or a plan is in progress
     Outcome last;                            // the last finished command, for display
     std::shared_ptr<const Plan> plan;        // the operator's plan, if any
+    StreamView stream;
 };
 
 class Core {
@@ -124,7 +149,22 @@ public:
     void run_plan(std::shared_ptr<const Plan> plan, Source from, MotionCallbacks cb);
     void run_path(std::vector<Joints> waypoints, Source from, MotionCallbacks cb);   // the twin times it
     void run_timed(ec::planning::Trajectory traj, Source from, MotionCallbacks cb);  // checked against the limits
-    void cancel_motion(const std::string& reason);
+    void cancel_motion(const std::string& reason);   // ends a stream too
+
+    // Streams: joint targets one at a time (a policy, teleop), at any rate (5-50 Hz).
+    // The first target starts the stream if `from` may command (as for motions), nothing else
+    // runs, the arm is stopped and the target is within start_tolerance of it. Every target is
+    // checked before it is used: within max_step of the previous one, joint limits, and
+    // collisions on the straight way from the previous one. A target that fails ends the
+    // stream; so do silence for timeout_ms (the dead man), STOP, losing the permission, or the
+    // streamer aborting (fault, tracking error). The arm then stops at the last good target.
+    // Between targets ec::Streamer interpolates every 8 ms and limits the speed.
+    // Shadow mode: the targets are checked and shown (view().stream), never sent; it needs no
+    // permission, so a policy can be watched on the real robot before it is let loose.
+    void stream_target(const Joints& q, Source from);   // deg; any thread, returns at once
+    void end_stream(const std::string& reason);          // any thread
+    void set_shadow(bool on);
+    void set_stream_settings(const StreamSettings& settings);
 
     // --- the operator's planning (OMPL) ---------------------------------------------------------
     void plan_to(const Joints& goal);   // result in view().plan / view().last
@@ -145,6 +185,10 @@ private:
     asio::awaitable<Outcome> execute(const Plan& plan, Source from, const MotionCallbacks& cb);
     asio::awaitable<void> watch_permissions();
     void stop_with(const std::string& label, const std::string& reason, Callback done);
+    void handle_target(const Joints& q, Source from);
+    std::optional<std::string> check_target(const Joints& from_q, const Joints& q, const StreamSettings& set);
+    asio::awaitable<void> stream_loop(Source from);
+    void update_stream_view(const std::function<void(StreamView&)>& change);
 
     // planning thread: runs `fn` there and resumes the calling coroutine on the robot thread
     template <typename T>
@@ -153,6 +197,7 @@ private:
 
     std::string ip_;
     ec::planning::Planner planner_;   // planning thread only
+    ec::planning::Planner checker_;   // robot thread only: checks the streamed targets
 
     asio::io_context robot_context_, planning_context_;
     asio::executor_work_guard<asio::io_context::executor_type> robot_work_, planning_work_;
@@ -166,6 +211,8 @@ private:
     ec::planning::Limits limits_;
     int power_tool_ = 1;
     double power_speed_ = 20;   // %
+    StreamView stream_view_;
+    StreamSettings stream_settings_;
     std::atomic<bool> armed_{false}, external_{false}, connecting_{false};
     std::atomic<Source> active_{Source::None};
     std::atomic<double> progress_{0};
@@ -174,6 +221,16 @@ private:
     // robot thread only
     bool cancel_ = false;
     std::string cancel_reason_;
+    std::unique_ptr<ec::Streamer> streamer_;   // while a stream runs
+    bool stream_running_ = false;              // streamer_ started: targets can be set
+    Source stream_source_ = Source::None;
+    Joints last_target_{};                     // the last accepted target
+    Clock::time_point last_target_time_{};
+    bool end_requested_ = false;
+    std::string end_reason_;
+    std::optional<Joints> shadow_previous_;    // shadow mode: the previous target, and when
+    Clock::time_point shadow_previous_time_{};
+    bool shadow_ = false;
 
     std::thread robot_thread_, planning_thread_;   // last: start after everything above exists
 };

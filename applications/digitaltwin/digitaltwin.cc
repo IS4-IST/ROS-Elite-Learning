@@ -9,6 +9,13 @@
 //   --camera NAME=HOST:PORT   show a camera's H.264 stream in its own panel (repeat for
 //                      more). The simulator serves its cameras from port 5000:
 //                      --camera scene=127.0.0.1:5000 --camera wrist=127.0.0.1:5001
+//                      With ROS, each one is also published on /cameras/NAME/image_raw.
+//   Streams (/joint_command, a policy or teleop; see Core::stream_target):
+//   --stream-max-step 5       largest change between consecutive targets (deg)
+//   --stream-timeout 300      silence that ends a stream (ms)
+//   --stream-lookahead 200    controller lookahead (ms; on V3.11.2 100 vibrates)
+//   --stream-speed 30         speed limit of the streamed setpoints (deg/s)
+//   --shadow                  start in shadow mode: targets are checked and shown, never sent
 //
 // Mirroring uses only the monitor port (8056), which serves several clients, so the twin
 // can run next to anything. Every packet's joint angles go into the model (kinematics
@@ -233,9 +240,21 @@ void commands_panel(twin::Core& core, const twin::View& v, Ui& ui, const mjModel
     ImGui::SameLine();
     ImGui::TextColored(kGrey, "%s", ui.ros_text.c_str());
 
+    // streams (a policy or teleop on /joint_command)
+    bool shadow = v.stream.shadow;
+    if (ImGui::Checkbox("shadow mode", &shadow)) core.set_shadow(shadow);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Streamed targets (/joint_command) are checked and shown as the orange ghost,\n"
+                          "but never sent: watch a policy on the real robot before letting it move.");
+    ImGui::SameLine();
+    ImGui::TextColored(kGrey, "stream: %llu targets, %llu refused", static_cast<unsigned long long>(v.stream.targets),
+                       static_cast<unsigned long long>(v.stream.refused));
+    if (!v.stream.text.empty()) ImGui::TextWrapped("%s", v.stream.text.c_str());
+
     if (external_running) {
         ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.9f, 0.55f, 0.1f, 1));
-        ImGui::ProgressBar(static_cast<float>(v.progress), {-1, 0}, "external motion running");
+        ImGui::ProgressBar(v.stream.active ? 1.0f : static_cast<float>(v.progress), {-1, 0},
+                           v.stream.active ? "external stream running" : "external motion running");
         ImGui::PopStyleColor();
         ImGui::TextWrapped("%s", v.motion_text.c_str());
         ImGui::TextColored(kGrey, "Your motion controls are locked. STOP, or untick \"accept external\", aborts it.");
@@ -373,6 +392,8 @@ int main(int argc, char** argv) {
     std::string ip = "192.168.0.11";
     double max_change = 30, margin_mm = 10;
     bool no_ros = false;
+    bool shadow = false;
+    twin::StreamSettings stream_settings;
     std::vector<twin::CameraSource> camera_sources;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -380,6 +401,11 @@ int main(int argc, char** argv) {
         else if (a == "--max-change" && i + 1 < argc) max_change = std::stod(argv[++i]);
         else if (a == "--margin" && i + 1 < argc) margin_mm = std::stod(argv[++i]);
         else if (a == "--no-ros") no_ros = true;
+        else if (a == "--shadow") shadow = true;
+        else if (a == "--stream-max-step" && i + 1 < argc) stream_settings.max_step = std::stod(argv[++i]);
+        else if (a == "--stream-timeout" && i + 1 < argc) stream_settings.timeout_ms = std::stoi(argv[++i]);
+        else if (a == "--stream-lookahead" && i + 1 < argc) stream_settings.lookahead_ms = std::stoi(argv[++i]);
+        else if (a == "--stream-speed" && i + 1 < argc) stream_settings.max_speed = std::stod(argv[++i]);
         else if (a == "--camera" && i + 1 < argc) {
             twin::CameraSource source;
             if (!twin::parse_camera_source(argv[++i], static_cast<int>(camera_sources.size()), source)) {
@@ -398,6 +424,7 @@ int main(int argc, char** argv) {
         ec::DataPtr data(mj_makeData(model.get()));         // the observed robot
         ec::DataPtr ghost(mj_makeData(model.get()));        // the joint target
         ec::DataPtr plan_ghost(mj_makeData(model.get()));   // the plan preview
+        ec::DataPtr stream_ghost(mj_makeData(model.get())); // the latest streamed target
         ec::reset_home(model.get(), data.get());
         mj_forward(model.get(), data.get());
         const int tcp_site = mj_name2id(model.get(), mjOBJ_SITE, "tcp");
@@ -405,6 +432,8 @@ int main(int argc, char** argv) {
         ec::planning::Options plan_options;
         plan_options.margin = margin_mm / 1000.0;
         twin::Core core(model.get(), ip, plan_options);
+        core.set_stream_settings(stream_settings);
+        if (shadow) core.set_shadow(true);
         Ui ui;
         ui.max_change = max_change;
 
@@ -413,7 +442,9 @@ int main(int argc, char** argv) {
         if (no_ros) {
             ui.ros_text = "ROS: off (--no-ros)";
         } else {
-            ros = std::make_unique<twin::RosInterface>(core, argc, argv);
+            std::vector<std::string> camera_names;
+            for (const twin::CameraSource& source : camera_sources) camera_names.push_back(source.name);
+            ros = std::make_unique<twin::RosInterface>(core, camera_names, argc, argv);
             ui.ros_text = "ROS: on";
         }
 #else
@@ -431,8 +462,18 @@ int main(int argc, char** argv) {
         // cameras: received and decoded on this thread, shown as textures (after context and
         // viewer, so they're destroyed first)
         std::vector<std::unique_ptr<twin::CameraView>> cameras;
-        for (std::size_t c = 0; c < camera_sources.size(); ++c)
+        for (std::size_t c = 0; c < camera_sources.size(); ++c) {
             cameras.push_back(std::make_unique<twin::CameraView>(context, camera_sources[c], static_cast<int>(c)));
+#ifdef EC_HAVE_ROS
+            if (ros) {
+                twin::RosInterface* r = ros.get();
+                const std::string name = camera_sources[c].name;
+                cameras.back()->set_listener([r, name](const camera::DecodedFrame& image, const camera::FrameStamp& stamp) {
+                    r->publish_camera(name, image, stamp);
+                });
+            }
+#endif
+        }
 
         asio::high_resolution_timer rendering_timer{context};
         const GLFWvidmode* mode = glfwGetVideoMode(glfwGetPrimaryMonitor());
@@ -482,6 +523,13 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < 6; ++i) plan_ghost->qpos[model->jnt_qposadr[i]] = q[i] * kDeg;
                 mj_forward(model.get(), plan_ghost.get());
                 viewer.add_ghost(plan_ghost.get(), {0.3f, 0.6f, 1.0f, 0.35f});
+            }
+            // the latest streamed target: orange, red if it was refused
+            if (const auto& st = view.stream; st.target && (st.active || st.shadow)) {
+                for (int i = 0; i < 6; ++i) stream_ghost->qpos[model->jnt_qposadr[i]] = (*st.target)[i] * kDeg;
+                mj_forward(model.get(), stream_ghost.get());
+                viewer.add_ghost(stream_ghost.get(), st.target_ok ? std::array<float, 4>{1.0f, 0.6f, 0.1f, 0.4f}
+                                                                  : std::array<float, 4>{1.0f, 0.15f, 0.1f, 0.45f});
             }
             viewer.end_frame();
 

@@ -5,6 +5,7 @@
 
 #include <control_msgs/action/follow_joint_trajectory.hpp>
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
+#include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_srvs/srv/set_bool.hpp>
 #include <std_srvs/srv/trigger.hpp>
@@ -15,6 +16,8 @@
 #include <string>
 #include <future>
 #include <functional>
+#include <map>
+#include <mutex>
 #include <thread>
 
 using namespace std::chrono_literals;
@@ -24,6 +27,7 @@ namespace {
 
 using FollowJointTrajectory = control_msgs::action::FollowJointTrajectory;
 using GoalHandle = rclcpp_action::ServerGoalHandle<FollowJointTrajectory>;
+using sensor_msgs::msg::Image;
 using sensor_msgs::msg::JointState;
 using diagnostic_msgs::msg::DiagnosticStatus;
 using diagnostic_msgs::msg::KeyValue;
@@ -56,6 +60,14 @@ std::vector<double> to_rad(const ec::Joints& q) {
     return v;
 }
 
+// A steady-clock time (the monitor's receive time) as system-clock ROS time, so joint states
+// and camera frames (stamped by the cameras' clocks) can be paired
+builtin_interfaces::msg::Time to_ros_time(ec::Clock::time_point t) {
+    const auto system = std::chrono::system_clock::now() - (ec::Clock::now() - t);
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(system.time_since_epoch()).count();
+    return rclcpp::Time(ns, RCL_SYSTEM_TIME);
+}
+
 KeyValue kv(std::string key, std::string value) {
     KeyValue k;
     k.key = std::move(key);
@@ -71,7 +83,7 @@ struct RosInterface::Impl {
     // The node only keeps WEAK references to its callback groups: they must live here,
     // or their timers/services/action silently stop (or crash the executor) once the
     // constructor returns.
-    rclcpp::CallbackGroup::SharedPtr state_group, stop_group, service_group, action_group;
+    rclcpp::CallbackGroup::SharedPtr state_group, stop_group, service_group, action_group, command_group;
     std::shared_ptr<rclcpp::executors::MultiThreadedExecutor> executor;
     std::thread spin_thread;
 
@@ -81,6 +93,10 @@ struct RosInterface::Impl {
     rclcpp::Service<Trigger>::SharedPtr stop_srv, clear_srv;
     rclcpp::Service<SetBool>::SharedPtr power_srv;
     rclcpp_action::Server<FollowJointTrajectory>::SharedPtr action;
+    rclcpp::Subscription<JointState>::SharedPtr command_sub;
+
+    // Made in the constructor and never changed after, so publish_camera can read it from any thread
+    std::map<std::string, rclcpp::Publisher<Image>::SharedPtr> camera_pubs;
 
     std::mutex goal_mutex;
     std::shared_ptr<GoalHandle> active_goal;
@@ -94,7 +110,8 @@ struct RosInterface::Impl {
     void finish(const std::shared_ptr<GoalHandle>& goal, const Outcome& outcome, bool started);
 };
 
-RosInterface::RosInterface(Core& core, int argc, char** argv) : impl_(std::make_unique<Impl>(core)) {
+RosInterface::RosInterface(Core& core, const std::vector<std::string>& cameras, int argc, char** argv)
+    : impl_(std::make_unique<Impl>(core)) {
     // No ROS signal handler: the twin handles Ctrl+C itself (closes the window, stops a motion)
     rclcpp::init(argc, argv, rclcpp::InitOptions(), rclcpp::SignalHandlerOptions::None);
     Impl& d = *impl_;
@@ -106,10 +123,13 @@ RosInterface::RosInterface(Core& core, int argc, char** argv) : impl_(std::make_
     d.stop_group = d.node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     d.service_group = d.node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     d.action_group = d.node->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+    d.command_group = d.node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
     // --- publishers ---------------------------------------------------------------------
     d.joints_pub = d.node->create_publisher<JointState>("joint_states", 10);
     d.status_pub = d.node->create_publisher<DiagnosticStatus>("robot_status", 10);
+    for (const std::string& name : cameras)
+        d.camera_pubs[name] = d.node->create_publisher<Image>("cameras/" + name + "/image_raw", rclcpp::SensorDataQoS());
     d.joints_timer = d.node->create_wall_timer(2ms, [&d] { d.publish_joints(); }, d.state_group);
     d.status_timer = d.node->create_wall_timer(100ms, [&d] { d.publish_status(); }, d.state_group);
 
@@ -121,7 +141,7 @@ RosInterface::RosInterface(Core& core, int argc, char** argv) : impl_(std::make_
             res->success = o.ok;
             res->message = o.message;
         },
-        rmw_qos_profile_services_default, d.stop_group);
+        rclcpp::ServicesQoS(), d.stop_group);
     d.power_srv = d.node->create_service<SetBool>(
         "power",
         [&d](const std::shared_ptr<SetBool::Request> req, std::shared_ptr<SetBool::Response> res) {
@@ -131,7 +151,7 @@ RosInterface::RosInterface(Core& core, int argc, char** argv) : impl_(std::make_
             res->success = o.ok;
             res->message = o.message;
         },
-        rmw_qos_profile_services_default, d.service_group);
+        rclcpp::ServicesQoS(), d.service_group);
     d.clear_srv = d.node->create_service<Trigger>(
         "clear_alarm",
         [&d](const std::shared_ptr<Trigger::Request>, std::shared_ptr<Trigger::Response> res) {
@@ -140,7 +160,29 @@ RosInterface::RosInterface(Core& core, int argc, char** argv) : impl_(std::make_
             res->success = o.ok;
             res->message = o.message;
         },
-        rmw_qos_profile_services_default, d.service_group);
+        rclcpp::ServicesQoS(), d.service_group);
+
+    // --- streamed joint targets (a policy, teleop) -------------------------------------------
+    rclcpp::SubscriptionOptions command_options;
+    command_options.callback_group = d.command_group;
+    d.command_sub = d.node->create_subscription<JointState>(
+        "joint_command", rclcpp::SensorDataQoS(),
+        [&d](const JointState::SharedPtr msg) {
+            if (msg->position.size() != 6) return;
+            ec::Joints q;
+            if (msg->name.empty()) {
+                for (int i = 0; i < 6; ++i) q[i] = msg->position[i] / kDeg;
+            } else {
+                if (msg->name.size() != 6) return;
+                for (int c = 0; c < 6; ++c) {
+                    const auto it = std::find(kJointNames.begin(), kJointNames.end(), msg->name[c]);
+                    if (it == kJointNames.end()) return;
+                    q[it - kJointNames.begin()] = msg->position[c] / kDeg;
+                }
+            }
+            d.core.stream_target(q, Source::External);
+        },
+        command_options);
 
     // --- action ---------------------------------------------------------------------------
     d.action = rclcpp_action::create_server<FollowJointTrajectory>(
@@ -164,7 +206,8 @@ RosInterface::RosInterface(Core& core, int argc, char** argv) : impl_(std::make_
     d.executor->add_node(d.node);
     d.spin_thread = std::thread([&d] { d.executor->spin(); });
     RCLCPP_INFO(d.node->get_logger(),
-                "digitaltwin: /joint_states, /robot_status, /stop, /power, /clear_alarm, /follow_joint_trajectory");
+                "digitaltwin: /joint_states, /robot_status, /cameras/*/image_raw, /joint_command, /stop, /power, "
+                "/clear_alarm, /follow_joint_trajectory");
 }
 
 RosInterface::~RosInterface() {
@@ -184,7 +227,7 @@ void RosInterface::Impl::publish_joints() {
     if (!s || s->received == last_packet) return;   // one message per monitor packet
     last_packet = s->received;
     JointState msg;
-    msg.header.stamp = node->now();
+    msg.header.stamp = to_ros_time(s->received);   // when the packet arrived, not when it is published
     msg.name.assign(kJointNames.begin(), kJointNames.end());
     msg.position.resize(6);
     msg.velocity.resize(6);
@@ -226,7 +269,37 @@ void RosInterface::Impl::publish_status() {
     msg.values.push_back(kv("external_control", v.external ? "granted" : "not granted"));
     msg.values.push_back(kv("active_motion", to_string(v.active)));
     msg.values.push_back(kv("progress", std::to_string(v.progress)));
+    msg.values.push_back(kv("stream", v.stream.active ? std::string("active (") + to_string(v.stream.source) + ")"
+                                    : v.stream.shadow ? "shadow" : "off"));
+    msg.values.push_back(kv("stream_targets", std::to_string(v.stream.targets)));
+    msg.values.push_back(kv("stream_refused", std::to_string(v.stream.refused)));
+    msg.values.push_back(kv("stream_text", v.stream.text));
     status_pub->publish(msg);
+}
+
+void RosInterface::publish_camera(const std::string& name, const camera::DecodedFrame& image,
+                                  const camera::FrameStamp& stamp) {
+    Impl& d = *impl_;
+    const auto found = d.camera_pubs.find(name);
+    if (found == d.camera_pubs.end()) return;
+    const rclcpp::Publisher<Image>::SharedPtr& pub = found->second;
+    if (pub->get_subscription_count() == 0) return;   // nobody listens: skip the copy
+    auto msg = std::make_unique<Image>();
+    msg->header.stamp = rclcpp::Time(stamp.capture_ns, RCL_SYSTEM_TIME);
+    msg->header.frame_id = name;
+    msg->width = static_cast<std::uint32_t>(image.width);
+    msg->height = static_cast<std::uint32_t>(image.height);
+    msg->encoding = "rgb8";
+    msg->step = msg->width * 3;
+    msg->data.resize(static_cast<std::size_t>(msg->step) * msg->height);
+    const std::uint8_t* src = image.rgba.data();
+    std::uint8_t* dst = msg->data.data();
+    for (std::size_t i = 0, n = static_cast<std::size_t>(image.width) * image.height; i < n; ++i, src += 4, dst += 3) {
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
+    }
+    pub->publish(std::move(msg));
 }
 
 // --- action ------------------------------------------------------------------------------------
